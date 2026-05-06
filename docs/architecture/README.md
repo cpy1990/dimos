@@ -1212,11 +1212,108 @@ dimos/rxpy_backpressure/
 
 ### § 7. 端到端数据流
 
-<!-- TODO: Task 11 -->
+举一条具体路径：用户说"走到红色物体"。
+
+这条路径完整地串联了感知、记忆、决策、导航、控制、语音六个核心子系统，是理解 DimOS 整体数据流最直观的入口。整个过程从用户的一句自然语言出发，经过 LLM 推理、多模态感知、空间记忆检索、路径规划、运动控制，最终以语音回复用户，形成完整的人机交互闭环。以下先给出时序图，再逐阶段说明各模块的角色与 transport，最后列出关键锚点供快速定位源码。
+
+```mermaid
+sequenceDiagram
+  participant U as User (CLI/MCP)
+  participant A as Agent (§4)
+  participant P as Perception module2D
+  participant M as Memory (spatial)
+  participant N as Navigation A*
+  participant C as Control
+  participant R as Robot
+  participant T as TTS skill
+
+  U->>A: "走到红色物体"
+  A->>P: 订阅 Detection stream
+  P->>M: 写 spatial entry (red_object @ pose)
+  A->>M: 查"红色物体"位置
+  M-->>A: pose
+  A->>N: 调 navigate_to(pose) skill
+  N->>C: 发 Path
+  C->>R: 控制
+  R-->>P: 摄像头持续反馈
+  N-->>A: arrived
+  A->>T: speak("到了")
+  T-->>U: 语音播放
+```
+
+#### 各阶段说明
+
+**1. 用户输入（User → Agent）**
+
+用户通过 CLI 或 MCP 客户端输入自然语言指令"走到红色物体"。Agent 接收后进入 LLM 推理循环，将自然语言意图解析为可执行的 skill 调用序列。整个解析过程由 LLM（默认 Claude）完成，系统提示词中包含当前机器人平台支持的 skill 列表与参数说明。这一步没有跨进程的网络 transport——指令以 Python 函数调用的方式直接传递给 Agent 的 `run()` 入口，延迟在毫秒级。若用户通过 MCP 客户端接入，则指令先经 MCP 协议传入 `McpServer` 模块，再交由 Agent 处理。
+
+**2. 感知启动（Agent → Perception module2D）**
+
+Agent 订阅 `perception.detection.module2D` 模块暴露的 `Detection` stream。摄像头以固定帧率（通常 15–30 FPS）持续采集 RGB 图像，送入 YOLO 或类似的二维目标检测模型。模型输出带有类别标签、置信度和像素级边界框的检测结果，随后通过深度图或双目视差转换为三维坐标。Transport 为 LCM，消息类型为 `Detection`（见 `dimos/types/detection.py`）。这一 stream 是持续发布的，不因 Agent 是否在线而停止——感知模块始终独立运行，保持对环境的实时观察。
+
+**3. 写入空间记忆（Perception → Memory）**
+
+检测到红色物体后，`perception.detection.module2D` 将目标的三维位姿（pose）写入 `memory.embedding` 子系统，以 spatial entry 形式存储（键名含类别与颜色）。写入通过 RPC 调用完成，底层 transport 为 SHM（共享内存），延迟极低。
+
+**4. Agent 查询位置（Agent → Memory）**
+
+Agent 的 LLM 循环调用 memory 查询 skill，以"红色物体"为检索词，从 spatial memory 拿回最新 pose 坐标。Memory 子系统返回的是结构化数据，Agent 将其作为参数传给导航 skill。
+
+**5. 导航规划（Agent → Navigation A\*）**
+
+Agent 调用 `navigation.replanning_a_star` 模块的 `navigate_to(pose)` skill。该模块在当前占用栅格地图（occupancy grid）上执行 A\* 路径规划，生成从当前位置到目标位姿的最短可行路径，输出为 `Path` 消息。在机器人移动过程中，导航模块以固定频率持续重规划（replanning），以实时响应地图更新和动态障碍物。规划出的 `Path` 与期望速度 `Velocity` 消息通过 DDS transport 向下传递给控制层。replanning 频率和地图来源（SLAM 在线建图或离线静态地图）可通过 blueprint 配置。
+
+**6. 运动控制（Navigation → Control → Robot）**
+
+`control.tick_loop` 模块将 `Path`/`Velocity` 转换为关节指令 `JointCmd`，以高频率（通常 ≥50 Hz）发送给机器人底层驱动。Transport 视平台而定：仿真器走 SHM，真实机器人走 DDS 或专有协议（Unitree SDK）。机器人执行运动的同时，摄像头继续采集帧，形成感知-控制闭环。
+
+**7. 到达反馈（Navigation → Agent）**
+
+导航模块持续比较机器人当前位姿与目标位姿的误差。当误差收敛到预设容差范围内（通常位置误差 ≤ 0.1 m，航向误差 ≤ 5°），模块判断导航成功，向 Agent 返回 `arrived` 信号，skill 调用以成功状态结束。若超过最大等待时间仍未到达（如路径被完全堵死），则返回超时失败，Agent 可据此重试或执行回退策略。Agent 的 LLM 循环在等待 skill 结果期间是阻塞的，不会并发发出新的 skill 调用。
+
+**8. TTS 语音播放（Agent → TTS → User）**
+
+Agent 调用 `skills.speak` skill，将"到了"文本转换为语音并播放给用户。TTS skill 通过 LCM RPC 触发，最终输出到扬声器或音频接口，完成本次指令的闭环。
+
+#### 关键锚点
+
+| 阶段 | Module | 主要 stream | Transport |
+|---|---|---|---|
+| 检测 | `perception.detection.module2D` | `Detection` | LCM |
+| 记忆 | `memory.embedding` | RPC 读写 | SHM |
+| 决策 | `agents.agent` | LLM 内部循环 | n/a |
+| 导航 | `navigation.replanning_a_star` | `Path`、`Velocity` | DDS |
+| 控制 | `control.tick_loop` | `JointCmd` | DDS / SHM |
+| TTS | `skills.speak` | RPC | LCM |
+
+> **更深入**：详细字段级 trace、`--replay` 模式差异、manipulation 路径见 [`data-flow.md`](data-flow.md)。
 
 ### § 8. 怎么继续读 + 常见踩坑
 
-<!-- TODO: Task 11 -->
+阅读到这里，你已经对 DimOS 的整体架构有了系统性认识——从进程模型、transport、agent/skill 栈，到子系统拓扑，再到完整的端到端数据流。接下来根据你的具体场景，选择对应的专题文档深入。
+
+#### 五个专题文档何时翻
+
+| 文档 | 适用场景 |
+|---|---|
+| [`runtime-model.md`](runtime-model.md) | 调试进程/transport/日志 |
+| [`agent-stack.md`](agent-stack.md) | 写新 skill / 集成 LLM |
+| [`robot-platforms.md`](robot-platforms.md) | 上新机器人/末端 |
+| [`subsystems.md`](subsystems.md) | 进入某个子系统改代码 |
+| [`data-flow.md`](data-flow.md) | 跟 stream 卡顿/类型不匹配 |
+
+**常见踩坑提示**：新写的 `@skill` 必须有 docstring 且每个参数都要类型注解，否则 module 启动时注册失败但不报明确错误；`dimos mcp` 命令仅对含 `McpServer` 的 blueprint 生效；`all_blueprints.py` 是自动生成的，手动修改会在下次 `pytest` 时被覆盖。详细的"必踩坑"清单维护在 `AGENTS.md`，本文档不重复。
+
+#### 仓库其他文档
+
+| 文档 | 用途 |
+|---|---|
+| [`AGENTS.md`](../../AGENTS.md) | quick-start cheat sheet 与"必踩的坑"（不在本文档重复） |
+| [`docs/usage/`](../usage/) | 使用教程 |
+| [`docs/capabilities/`](../capabilities/) | 能力深度文档 |
+| [`docs/platforms/`](../platforms/) | 具体硬件平台 |
+| [`docs/installation/`](../installation/) | 安装指引 |
+| [`docs/development/`](../development/) | 开发与测试 |
 
 ---
 
