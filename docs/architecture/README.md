@@ -1092,7 +1092,123 @@ dimos/web/
 
 ---
 
-<!-- TODO: Task 10 (subsystems 9-13) -->
+#### 9. visualization/rerun/ — Rerun 桥
+
+**职责**：将 pubsub 消息流实时写入 [Rerun](https://rerun.io/) 可视化查看器，供开发者在本地或远程观察传感器数据、导航路径与机器人状态时序流。
+
+**关键文件**：
+
+```text
+dimos/visualization/
+├── rerun/
+│   ├── bridge.py             # RerunBridgeModule：订阅 pubsub，将消息转换为 Rerun Archetype 写入查看器
+│   └── test_viewer_integration.py
+└── bridge.py                 # Foxglove WebSocket bridge（备选可视化路径）
+```
+
+**核心机制**：`RerunBridgeModule` 订阅 LCM pubsub 上的所有（或 glob 过滤的）topic，对每条消息调用其 `to_rerun()` 方法转为 `RerunData`，然后调用 `rr.log()` 写入 Rerun 时间轴。`Image` 与 `PointCloud2` 等大负载消息自动限速（防止查看器 OOM），轻量消息（Path、TF、EntityMarkers 等）则直通不限速，保证导航叠加层实时性。查看器模式（本地 / 远程 / 离线）由 `Config.viewer_mode` 控制。
+
+**设计取舍**
+
+- **Rerun vs Foxglove**：`bridge.py`（Foxglove）提供 ROS bag / topic 兼容的 WebSocket 流，适合已有 ROS 工具链的团队；`rerun/bridge.py` 则以 Python 原生 API 为主，对时间序列与三维点云的交互式回溯体验更佳。两条路径并存——选哪条取决于下游查看器偏好，可在 Blueprint 中按需挂载不同 Module。
+- **重负载消息限速**：Image 约 1 MB/帧 × 30 fps，PointCloud2 约 600–800 KB/帧——如不限速会导致 Rerun 查看器 OOM。限速逻辑集中在 `bridge.py`，消息类型在 `_HEAVY_MSG_TYPES` 常量中声明，新增大负载类型时只需追加常量即可。
+
+**详细参考**：[`docs/capabilities/`](../../docs/capabilities/)。
+
+---
+
+#### 10. teleop/ — 远程操控
+
+**职责**：人工远程控制机器人。`teleop/` 将操作员的物理输入（键盘按键、手机触控、VR 控制器姿态）翻译为速度或关节命令，经 pubsub 发布给 `control/`，自身不含运动规划逻辑。
+
+**关键文件**：
+
+```text
+dimos/teleop/
+├── keyboard/
+│   └── keyboard_teleop_module.py   # 通用键盘 Module（跨机器人）
+├── phone/
+│   ├── phone_teleop_module.py      # 手机端 Module
+│   └── phone_extensions.py        # 手机端扩展
+└── quest/
+    ├── quest_teleop_module.py      # Meta Quest VR Module
+    ├── quest_extensions.py         # Quest 扩展
+    └── quest_types.py              # Quest 专用数据类型
+```
+
+**设计取舍**：三种输入设备（键盘 / 手机 / VR）各封装为独立 Module，按硬件能力互斥挂载到 Blueprint。独立封装使每种输入路径可以单独测试、单独替换，也避免在同一模块内累积三种设备的特殊逻辑。
+
+> **小心**：`dimos/teleop/keyboard/keyboard_teleop_module.py`（通用）与 `dimos/robot/unitree/keyboard_teleop.py`（unitree 专用）是**两份不同实现**——前者是跨机器人通用 Module，后者直接调用 Unitree SDK 专有接口，仅适用于 Go2 / G1。修改键盘控制行为时需确认当前 Blueprint 挂载的是哪份实现。
+
+**详细参考**：[`docs/capabilities/`](../../docs/capabilities/)。
+
+---
+
+#### 11. msgs/ — ROS 兼容消息类型
+
+**职责**：提供与 ROS 2 消息格式兼容的纯 Python 消息类型，使 dimos 各模块可在**无完整 ROS 依赖**的环境下收发结构化消息。
+
+**关键文件**：
+
+```text
+dimos/msgs/
+├── geometry_msgs/   # Point, Pose, PoseStamped, Quaternion, Twist…
+├── sensor_msgs/     # Image, PointCloud2, Imu, JointState, CameraInfo…
+├── nav_msgs/        # 导航相关（Path, Odometry…）
+├── vision_msgs/     # 视觉检测结果
+├── tf2_msgs/        # 坐标变换
+├── std_msgs/        # 标准原语（Header, String…）
+├── trajectory_msgs/ # 轨迹表示
+├── visualization_msgs/ # 可视化 Marker
+├── foxglove_msgs/   # Foxglove 专有格式（ImageAnnotations, Color…）
+├── helpers.py       # 消息构造辅助函数
+└── protocol.py      # 消息协议抽象
+```
+
+**设计取舍**：在无 ROS 的纯 Python 部署中，直接 `pip install rclpy` 代价极高（约 1 GB 依赖树）。`msgs/` 自维护轻量消息定义，与 ROS 2 IDL 字段保持一致，确保同一消息类型可在 ROS 环境和纯 Python 环境下序列化/反序列化而无需修改业务代码。与 ROS 原版的差异（如缺少某些枚举值或服务类型）由 `types/ros_polyfill.py` 补齐。
+
+---
+
+#### 12. types/ — 跨模块共享类型
+
+**职责**：定义被多个 Module 共用的基础数据类型，避免各模块重复定义导致类型不兼容。
+
+**关键文件**：
+
+```text
+dimos/types/
+├── vector.py              # Vector（多维数值向量，支持 numpy 互转）
+├── timestamped.py         # Timestamped[T]（泛型时间戳包装）
+├── robot_location.py      # RobotLocation（坐标 + 朝向 + 时间戳）
+├── robot_capabilities.py  # RobotCapability（枚举：MANIPULATION / VISION / AUDIO / LOCOMOTION…）
+├── ros_polyfill.py        # ROS 类型 stand-in（无 ROS 时提供替代实现）
+├── sample.py              # Sample 数据类
+└── weaklist.py            # 弱引用列表工具
+```
+
+**设计取舍**：`types/` 有意保持极小——只放**跨 Module 边界流通**且不属于任何单一子系统的类型。`ros_polyfill.py` 是其中最关键的一项：它以 `try/except ImportError` 机制，在 ROS 未安装时为 `geometry_msgs.msg.Vector3` 等 ROS 类型提供结构等价的纯 Python 替代，使依赖这些类型的模块无需条件分支即可正常运行。`RobotCapability` 枚举则由 Blueprint 层用于声明当前平台的能力集，Agent 据此选择可调用的 skill 范围。
+
+---
+
+#### 13. rxpy_backpressure/ — 反应式背压
+
+**职责**：为 RxPY 可观测流提供背压（backpressure）控制原语，防止下游消费者被上游高频消息流淹没。
+
+**关键文件**：
+
+```text
+dimos/rxpy_backpressure/
+├── backpressure.py    # BackPressure 入口类（暴露 LATEST / DROP / BUFFER 三种策略）
+├── latest.py          # LatestBackPressureStrategy：只保留最新消息，旧消息丢弃
+├── drop.py            # DropBackPressureStrategy：有界缓存，超出则丢旧消息
+├── function_runner.py # 线程化函数执行器（保证消费者串行调用）
+├── locks.py           # BooleanLock：轻量布尔锁，避免并发重入
+└── observer.py        # Observer 抽象基类
+```
+
+**设计取舍**：RxPY 本身不内置背压机制——当传感器以 30 Hz 发布帧而下游 ML 推理只能处理 5 Hz 时，若不做限速，内部队列会无限膨胀并最终导致 OOM 或延迟累积。`LATEST` 策略适合实时性优先的场景（导航、控制）：永远处理最新帧，跳过中间帧；`DROP` 策略适合需要保序但可接受丢弃最旧数据的场景（日志采样）；`BUFFER` 策略无界缓存用于离线批处理。没有这一层，诊断流水线卡顿只能靠猜测——有了明确的背压策略，调试时可直接定位"哪个消费者跟不上"而非排查整条链路。
+
+---
 
 ### § 7. 端到端数据流
 
