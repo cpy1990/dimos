@@ -337,14 +337,14 @@ CLI 执行 `dimos run <blueprint>` 后，若带 `--daemon` 标志则调用 `daem
   ↓ 被覆盖
 .env 文件（通过 SettingsConfigDict(env_file=".env") 加载）
   ↓ 被覆盖
-DIMOS_* 环境变量（pydantic-settings 自动按 DIMOS_<FIELD_NAME> 格式识别）
+环境变量（无前缀，直接匹配字段名，大小写不敏感）
   ↓ 被覆盖
 Blueprint 显式调用 global_config.update(**overrides) 注入的覆写值
   ↓ 被覆盖
 CLI 标志（dimos run --n-workers 4 等，typer 动态回调写入 global_config）
 ```
 
-五层级联中，**CLI 标志优先级最高**，可以在不修改任何文件的情况下临时调整任何配置项，方便调试。Blueprint 层的覆写（`update()` 调用）则允许特定蓝图固定某些参数（如专用 MCP 端口），不受环境变量干扰。`.env` 文件适合把机器人 IP、API key 等部署级参数版本化但不提交（`.gitignore` 排除），团队成员各自维护本地 `.env`。所有 `GlobalConfig` 字段均对应一个 `DIMOS_<FIELD_NAME>` 环境变量：例如 `DIMOS_ROBOT_IP`、`DIMOS_N_WORKERS`、`DIMOS_SIMULATION`，CI/容器环境通过注入环境变量即可完成配置，无需改代码。
+五层级联中，**CLI 标志优先级最高**，可以在不修改任何文件的情况下临时调整任何配置项，方便调试。Blueprint 层的覆写（`update()` 调用）则允许特定蓝图固定某些参数（如专用 MCP 端口），不受环境变量干扰。`.env` 文件适合把机器人 IP、API key 等部署级参数版本化但不提交（`.gitignore` 排除），团队成员各自维护本地 `.env`。所有 `GlobalConfig` 字段直接映射到同名环境变量（pydantic-settings 默认大小写不敏感，无前缀）：例如 `ROBOT_IP`、`N_WORKERS`、`SIMULATION` 均可直接覆盖对应字段，CI/容器环境通过注入环境变量即可完成配置，无需改代码。
 
 每次 `GlobalConfig()` 实例化时（程序启动时仅做一次），pydantic-settings 按此顺序解析并合并所有来源。`global_config` 是模块级单例，整个运行期共享同一实例；`update()` 方法允许 Blueprint 在 build 阶段原地修改字段，后续代码感知同一对象上的最新值。
 
