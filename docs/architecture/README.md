@@ -680,7 +680,269 @@ DimOS CLI 通过三个互斥（或组合）标志控制运行时后端：
 
 ### § 6. 能力子系统全景
 
-<!-- TODO: Tasks 8-10 -->
+DimOS 现有 13 个一级子系统。以下按职责拓扑排序，**核心 8 项每项详写**，**辅助 5 项每项简介**。每项末尾给"链到现有 docs/"，让读者按需深入。各子系统在代码层面均以 `dimos/<subsystem>/` 顶层包形式存在，通过 RxPY `Observable` stream 互联，不持有跨系统的直接对象引用。
+
+```mermaid
+flowchart LR
+  subgraph 基础库
+    MSG[msgs/]
+    TYP[types/]
+    RXBP[rxpy_backpressure/]
+  end
+  subgraph 核心
+    CTRL[control/]
+    PER[perception/]
+    NAV[navigation/]
+    MAN[manipulation/]
+    MAP[mapping/]
+    MEM[memory/]
+    MOD[models/]
+    WEB[web/]
+  end
+  subgraph 接口与可视化
+    VIZ[visualization/rerun/]
+    TEL[teleop/]
+    AGT((Agent §4))
+  end
+  PER --> MEM
+  PER --> NAV
+  PER --> MAN
+  PER --> MAP
+  CTRL --> MAN
+  CTRL --> NAV
+  MOD --> PER
+  MOD --> AGT
+  MAP --> NAV
+  AGT --> NAV
+  AGT --> MAN
+  AGT --> MEM
+  WEB --> AGT
+  VIZ --> PER
+  TEL --> CTRL
+```
+
+---
+
+#### 1. control/ — 低层控制循环
+
+**职责**
+
+`control/` 是 DimOS 中唯一负责实时确定性执行的子系统。它将"决策"与"执行"彻底解耦：上层 Module（Agent、Manipulation、Navigation）只需向 stream 推送目标（Goal/Task），`control/` 内部的 tick 循环负责读取硬件状态、计算各任务输出、对每个关节执行优先级仲裁，最终将指令路由至硬件。这一设计让控制频率与业务逻辑完全隔离，任意 Module 崩溃都不会打断底层运动。
+
+**关键文件**
+
+```
+dimos/control/
+├── tick_loop.py          # 核心：read→compute→arbitrate→route→write 单次 tick
+├── coordinator.py        # ControlCoordinator：Module 封装，管理所有 ConnectedHardware
+├── components.py         # 数据类：HardwareComponent、HardwareId、JointState
+├── hardware_interface.py # ConnectedHardware / ConnectedTwistBase 适配器包装
+├── tasks/
+│   ├── cartesian_ik_task.py   # 笛卡尔空间 IK 任务
+│   ├── trajectory_task.py     # 轨迹跟踪任务
+│   ├── servo_task.py          # 伺服任务（实时跟随目标位姿）
+│   ├── teleop_task.py         # 遥操作任务
+│   └── velocity_task.py       # 速度控制任务
+└── blueprints.py         # 预配置 Blueprint：coordinator-mock / coordinator-xarm7 / coordinator-dual-mock
+```
+
+**主要 stream**
+
+| 方向 | Stream 类型 | 说明 |
+|------|-------------|------|
+| 输入 | `HardwareCommand`（来自各 Task） | 各任务推送目标关节指令 |
+| 输入 | `TwistCmd`（来自 navigation/teleop） | 底盘速度指令 |
+| 输出 | `JointState`（聚合广播） | tick 结束后发布所有关节当前状态 |
+| 输出 | 抢占通知 | 仲裁结果变化时通知被抢占的任务 |
+
+**设计取舍**
+
+- **单 tick 循环**：coordinator 内只运行一个 `tick_loop` 线程，频率固定（默认 200 Hz），避免多线程竞态。上层 Module 通过 Subject/stream 异步推送目标，tick 每次读取最新值。
+- **per-joint 仲裁**：不同任务可同时控制不同关节，优先级以任务注册顺序决定；最高优先级任务控制某关节时，低优先级任务该关节静默。
+- **部分指令支持**：任务只需描述"它关心的关节"，其余关节保持上一指令或硬件默认行为，不强制全关节覆盖。
+- **适配器统一接口**：`ConnectedHardware`（关节臂）与 `ConnectedTwistBase`（差分底盘）暴露相同 `read_state / write_command` duck-type 接口，tick 无需区分硬件类型。
+
+**详细参考**：[`docs/capabilities/`](../../docs/capabilities/)，以及 `dimos/control/README.md`。
+
+---
+
+#### 2. perception/ — 感知（拆为三层）
+
+**职责**
+
+`perception/` 将原始相机帧转化为结构化语义信息。架构拆为三层：**检测核心**（纯算法，无 Module 依赖）、**上层封装**（时序融合、ReID、空间注册）、**实验性时序记忆**（基于 RAG 的时空语义检索）。三层相互解耦，可独立替换内部实现。
+
+**关键文件**
+
+```
+dimos/perception/
+│
+├── 检测核心（detection/）
+│   ├── module2D.py           # 2D 检测 Module：Frame → Detection2DArray
+│   ├── module3D.py           # 3D 检测 Module：融合深度图/点云
+│   ├── moduleDB.py           # 检测数据库 Module，持久化检测历史
+│   ├── objectDB.py           # 对象数据库：跨帧聚合同一物体
+│   ├── person_tracker.py     # 专用行人跟踪器
+│   ├── detectors/            # 算法实现：YOLO、YOLOE、BBox 检测器配置
+│   ├── reid/                 # Re-ID：跨摄像头/跨帧身份匹配（embedding + 匹配模块）
+│   └── type/                 # 类型定义：Detection2D、Detection3D、ImageDetections
+│
+├── 上层封装
+│   ├── object_tracker_2d.py         # 2D 多目标跟踪封装
+│   ├── object_tracker_3d.py         # 3D 多目标跟踪封装
+│   ├── object_tracker.py            # 通用跟踪 Module Coordinator
+│   ├── spatial_perception.py        # 空间语义记忆模块
+│   ├── object_scene_registration.py # 将检测结果注册到场景坐标系
+│   └── perceive_loop_skill.py       # @skill 封装，供 Agent 调用感知循环
+│
+└── 实验性（experimental/temporal_memory/）
+    ├── temporal_memory.py        # 时序语义记忆核心（PR #1511，CLIP + 向量检索）
+    ├── entity_graph_db.py        # 实体图数据库
+    ├── frame_window_accumulator.py # 滑动窗口帧积累器
+    ├── window_analyzer.py        # 窗口分析器
+    ├── clip_filter.py            # CLIP 过滤器
+    └── temporal_state.py         # 时序状态管理
+```
+
+**主要 stream**
+
+| 方向 | Stream 类型 | 说明 |
+|------|-------------|------|
+| 输入 | `Image`（相机帧） | 来自硬件驱动或 Replay |
+| 输入 | `CameraInfo`（内参） | 3D 反投影所需 |
+| 输出 | `Detection2DArray` / `Detection3DArray` | 每帧检测结果 |
+| 输出 | `Track`（跨帧） | ReID 融合后的稳定轨迹 |
+| 输出 | `SpatialEntry` | 场景坐标系中的语义对象条目 |
+
+**设计取舍**
+
+- **检测核心保持纯算法**：`detection/` 内的类不继承 Module，不持有 stream，只实现算法逻辑，便于单元测试和 Mock。
+- **上层封装承担 stream 编排**：时序对齐、ReID、空间融合在上层封装中以 RxPY operator chain 实现，不侵入检测核心。
+- **`temporal_memory/` 标注为实验性**：PR #1511 引入基于 CLIP embedding 的时空 RAG；目前未接入主线 Blueprint，接口仍在迭代，生产环境慎用。
+- **分层可替换**：可单独替换 `detectors/yolo.py` 为其他推理后端，不影响上层跟踪逻辑。
+
+**详细参考**：[`docs/capabilities/perception/`](../../docs/capabilities/perception/)，PR #1511（temporal_memory 引入）。
+
+---
+
+#### 3. navigation/ — 导航与重规划
+
+**职责**
+
+`navigation/` 提供从"当前位姿"到"目标位姿"的路径规划与执行能力，并以策略模式并存多种算法：已知地图下的 A* 全局重规划、未知环境下的 Wavefront Frontier 探索、基于视觉的短距离追踪（视觉伺服与 BBox 导航）、以及通过 ROS Nav2 桥接的生产级路由。各策略共享 `NavigationInterface` 抽象，Agent 可在运行时动态选择策略。
+
+**关键文件**
+
+```
+dimos/navigation/
+├── base.py                    # NavigationInterface 抽象 + NavigationState 枚举
+├── replanning_a_star/         # A* 全局规划 + 动态重规划
+│   ├── module.py              # ReplanningAStarPlanner Module（stream 接口）
+│   ├── global_planner.py      # 全局代价地图 A* 实现（C++ 扩展加速）
+│   ├── local_planner.py       # 本地跟踪控制器
+│   ├── min_cost_astar.py      # 最小代价 A* 核心（含 .cpp 源码与 .so 扩展）
+│   ├── navigation_map.py      # 占用栅格地图管理
+│   ├── replan_limiter.py      # 重规划频率限制
+│   └── path_clearance.py      # 路径净空校验
+├── frontier_exploration/
+│   ├── wavefront_frontier_goal_selector.py  # Wavefront 前沿目标选择器
+│   └── utils.py               # 探索辅助工具
+├── visual_servoing/
+│   ├── visual_servoing_2d.py  # 2D 视觉伺服控制器（像素→Twist）
+│   └── detection_navigation.py # 基于检测的导航 Module
+├── bbox_navigation.py         # BBoxNavigationModule（按检测框导航）
+├── visual/
+│   └── query.py               # 视觉语义查询辅助
+└── rosnav.py                  # ROS Nav2 桥接 Module
+```
+
+**主要 stream**
+
+| 方向 | Stream 类型 | 说明 |
+|------|-------------|------|
+| 输入 | `PoseStamped`（里程计/定位） | 当前机器人位姿 |
+| 输入 | `OccupancyGrid`（代价地图） | 来自 mapping/ 或 ROS |
+| 输入 | `PoseStamped`（目标点） | 来自 Agent 或用户点击 |
+| 输入 | `Detection2DArray` | 视觉伺服/BBox 导航使用 |
+| 输出 | `Path` | 规划路径（全局） |
+| 输出 | `Twist`（cmd\_vel） | 底盘速度指令 |
+| 输出 | `Bool`（goal\_reached） | 目标到达信号 |
+
+**设计取舍**
+
+- **多策略并存**：A* 适用于已知地图精确导航；Frontier 适用于未知环境探索；视觉伺服适用于短距离目标跟踪；ROS Nav2 桥接面向生产部署。策略间通过 `NavigationInterface` 多态切换，不强制统一实现路径。
+- **A* C++ 扩展加速**：`min_cost_astar_ext.so` 由 `min_cost_astar_cpp.cpp` 编译，热路径在 C++ 层执行，Python 层仅做调度。
+- **cmd\_vel 直接输出至 control/**：导航不持有硬件引用，输出 `Twist` stream 由 `control/ControlCoordinator` 订阅并路由至底盘适配器，保持关注点分离。
+- **重规划频率受限**：`replan_limiter.py` 防止地图频繁更新导致规划抖动，避免无效轨迹切换。
+
+**详细参考**：[`docs/capabilities/navigation/`](../../docs/capabilities/navigation/)。
+
+---
+
+#### 4. manipulation/ — 抓取与操作
+
+**职责**
+
+`manipulation/` 提供机械臂的运动规划、抓取生成与拾放执行能力。架构分为两层：**算法层**（`manipulation/`）实现运动学、轨迹规划、抓取姿态生成等核心算法；**LLM 调用面**（`dimos/skills/manipulation/`）将算法层封装为 `@skill`，供 Agent 以自然语言调用。两层之间通过 `@rpc` / `@skill` 边界明确分工，避免算法逻辑与 LLM prompt 耦合（参见 §4 命名重叠 5：`manipulation/` vs `skills/manipulation/` 的职责边界）。
+
+**关键文件**
+
+```
+dimos/manipulation/
+├── manipulation_module.py      # ManipulationModule：@rpc 低层积木（plan_to_pose、execute 等）
+│                               #   + @skill 短时域动作（move_to_pose、open_gripper、go_home）
+├── pick_and_place_module.py    # PickAndPlaceModule（继承 ManipulationModule）
+│                               #   + 感知集成（objects port、scan_objects）
+│                               #   + @skill 长时域（pick、place、pick_and_place）
+├── manipulation_interface.py   # ManipulationInterface 抽象
+├── grasping/
+│   ├── grasping.py             # 抓取姿态计算核心
+│   ├── graspgen_module.py      # GraspGen Docker Module（异步抓取生成服务）
+│   └── demo_grasping.py        # 演示脚本（前缀 demo_ 不被 pytest 收集）
+├── planning/
+│   ├── factory.py              # 规划器工厂（根据配置选择 MoveIt/MuJoCo/Mock）
+│   ├── kinematics/             # 正/逆运动学求解
+│   ├── planners/               # 具体规划器实现
+│   ├── trajectory_generator/   # 轨迹生成与平滑
+│   └── world/                  # 碰撞世界表示
+└── control/
+    ├── coordinator_client.py   # 与 ControlCoordinator 通信的客户端
+    ├── trajectory_setter.py    # 将轨迹提交至 control/ tick 循环
+    ├── trajectory_controller/  # 轨迹执行控制器
+    └── servo_control/          # 伺服模式控制
+```
+
+**LLM 调用面**（`dimos/skills/manipulation/`）
+
+```
+dimos/skills/manipulation/
+├── abstract_manipulation_skill.py  # 抽象基类
+├── manipulate_skill.py             # 通用操作 @skill
+├── pick_and_place.py               # pick/place @skill 封装
+├── force_constraint_skill.py       # 力约束 @skill
+├── rotation_constraint_skill.py    # 旋转约束 @skill
+└── translation_constraint_skill.py # 平移约束 @skill
+```
+
+**主要 stream**
+
+| 方向 | Stream 类型 | 说明 |
+|------|-------------|------|
+| 输入 | `Detection2DArray` / `ObjectPose` | 来自 perception/，目标物体位姿 |
+| 输入 | `PoseStamped`（Goal） | 来自 Agent @skill 调用 |
+| 输出 | `JointTrajectory` | 规划轨迹，发送至 control/ |
+| 输出 | `GripperCmd` | 夹爪指令 |
+
+**设计取舍**
+
+- **算法层 vs LLM 调用面**：`manipulation/` 内部方法均为 `@rpc`（同步、可组合）；`skills/manipulation/` 内才有 `@skill`（返回 `str`，可被 Agent 直接调用）。这一分层确保算法单元可单独测试，不依赖 Agent 运行时。
+- **GraspGen 异步 Docker 服务**：`graspgen_module.py` 将耗时的抓取姿态生成卸载到 Docker 容器，主进程非阻塞；`pick_and_place_module.py` 通过 `generate_grasps @rpc` 触发并等待结果。
+- **轨迹执行不绕过 control/**：所有关节指令经由 `coordinator_client.py` 进入 `control/ControlCoordinator` 的 tick 循环，不直接写硬件，保持仲裁机制完整。
+- **碰撞世界可插拔**：`planning/world/` 支持 MuJoCo 仿真世界与真实世界两种模式，通过 `planning/factory.py` 在 Blueprint 层选择，代码路径一致。
+
+**详细参考**：[`docs/capabilities/manipulation/`](../../docs/capabilities/manipulation/)，`dimos/manipulation/planning/README.md`。
+
+<!-- TODO: Tasks 9-10 (subsystems 5-13) -->
 
 ### § 7. 端到端数据流
 
