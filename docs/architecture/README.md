@@ -106,7 +106,89 @@ dimos/                    # 仓库根
 
 ### § 1. 三个核心抽象
 
-<!-- TODO: Task 3 -->
+DimOS 的所有运行代码都围绕三个抽象组装：**Module / Blueprint / Skill**。读懂这三者，整个仓库的 80% 代码读起来就有定位感。
+
+#### Module —— 自治子系统
+
+Module 是 DimOS 最基础的运行单元。每个 Module 是一个继承自 `Module` 基类的 Python 类，代表一个独立的、可组合的能力模块——例如摄像头驱动、目标检测、导航规划或运动控制。Module 运行在独立的 forkserver 工作进程中，与主进程和其他 Module 物理隔离；进程间通过 LCM 消息总线或共享内存进行通信。
+
+Module 的数据接口通过类型注解声明：`In[T]` 表示输入流，`Out[T]` 表示输出流，`T` 是实际消息类型（如 `Image`、`PoseStamped`、`Twist`）。声明即接口——Blueprint 在构建时会读取这些注解，自动按 `(名称, 类型)` 匹配并连接各 Module 的流。流的底层传输是可替换的（LCM / ROS2 / DDS / 内存管道），Module 本身不感知传输细节。
+
+Module 还通过 `@rpc` 装饰器暴露可远程调用的方法。`@rpc` 方法是 Module 的过程调用面：其他 Module 或框架代码可以跨进程调用它们，保留原始返回类型。所有 Module 天然拥有两个基础 `@rpc` 方法：`start()` 负责初始化订阅和定时器，`stop()` 负责安全关闭和资源释放。
+
+#### Blueprint —— 用 autoconnect 拼装
+
+Blueprint 是一张描述"哪些 Module 共同构成这台机器人软件栈"的配置图。它本身是不可变数据结构（冻结 dataclass），因此可以安全地在多处复用和组合。
+
+`autoconnect(*blueprints)` 是拼装的核心：它接受多个 Module 级或 Blueprint 级蓝图，去重合并后返回一个新的 `Blueprint`。构建阶段（`.build()`）会为每个 Module 启动 forkserver 工作进程，然后扫描所有模块的 `In[T]` / `Out[T]` 注解，凡 `(名称, 类型)` 完全匹配的流对，自动共享同一个传输层实例——这就是"自动连线"。
+
+若两个 Module 恰好有同名但含义不同的流，可以用 `.remappings([(ModuleA, "old_name", "new_name"), ...])` 解决命名冲突，将某个 Module 的特定流改名后再参与匹配。Module 之间的 RPC 引用则通过 `Spec` Protocol 注解在编译时绑定，找不到匹配实现会在 build 阶段直接报错，而不是在运行时静默失败。
+
+#### Skill —— 智能体可调用的动作
+
+Skill 是 Agent 能调用的物理动作函数，定义在继承自 `Module` 的 Skill 容器类里。`@skill` 装饰器（`dimos/agents/annotation.py`）同时设置 `__rpc__ = True` 和 `__skill__ = True`：前者让该方法可以被跨进程 RPC 调用，后者让框架在注册时自动把函数签名和文档字符串转换成 LLM 工具调用所需的 JSON schema。
+
+`@skill` 与 `@rpc` 在职责上是两个不同的层面：`@rpc` 是 Module 内部 / Module 间的过程调用面，保留原始 Python 返回类型；`@skill` 是 LLM 向外暴露的工具接口，**必须返回 `str`**，因为语言模型只消费文本。因此，不要将两者叠加使用——`@skill` 已经蕴含了 `@rpc`。`@skill` 函数还有三条硬性规则：必须有文档字符串、所有参数必须类型注解、返回值必须是 `str`；违反任意一条都会导致模块注册失败或 LLM schema 缺失（详见 §4）。
+
+#### 三者关系（类图）
+
+```mermaid
+classDiagram
+  class Module {
+    +In~T~ inputs
+    +Out~T~ outputs
+    +@rpc methods
+    +start() void
+    +stop() void
+  }
+  class Blueprint {
+    +blueprints: tuple
+    +autoconnect()
+    +remappings()
+    +build() ModuleCoordinator
+  }
+  class Skill {
+    +@skill function
+    +returns str
+    +auto JSON schema
+  }
+  class Agent {
+    +Spec Protocol refs
+    +LLM tool calls
+  }
+  Blueprint o-- Module : 包含并编排
+  Module <|-- SkillContainer : Skill 定义在\nModule 子类中
+  Skill --* SkillContainer : @skill 方法
+  Agent ..> Skill : 通过 Spec Protocol\n引用 RPC 面
+```
+
+#### 最小可运行 Blueprint 片段
+
+```python
+from dimos.core.module import Module
+from dimos.core.stream import In, Out
+from dimos.core.core import rpc; from dimos.agents.annotation import skill
+from dimos.core.blueprints import autoconnect; from dimos.msgs.geometry_msgs import Twist
+class DriveModule(Module):    # ① Module：类型化流 + @rpc 调用面
+    cmd_vel: In[Twist]
+    @rpc
+    def start(self) -> None:
+        self.cmd_vel.subscribe(self._process)
+class Skills(Module):         # ② Skill：@skill 向 LLM 暴露工具 schema
+    @skill
+    def move(self, speed: float = 0.5) -> str:
+        """让机器人前进。Args: speed: m/s。"""
+        return f"以 {speed} m/s 前进"
+my_robot = autoconnect(DriveModule.blueprint(), Skills.blueprint())  # ③ Blueprint
+```
+
+#### 为什么这样分层
+
+**类型化流（In[T] / Out[T]）** 的设计目标是把"哪个流连接到哪里"从运行时错误提前到构建期。流的 `(名称, 类型)` 双重匹配确保一个 `In[Image]` 不会意外接到 `Out[Twist]`——类型不符时 `autoconnect` 在 `.build()` 阶段就会拒绝连线，而不是等到消息在运行时被错误解码才爆出隐晦的 deserialization 错误。这也使得传输层可以无缝替换（LCM / ROS2 / DDS / 内存管道），因为上层代码只依赖类型，不依赖具体传输 API。
+
+**forkserver 进程模型**的选择优先于 `fork`，原因有三：`fork` 会把父进程中已初始化的 CUDA 上下文、GPU 内存映射和打开的 socket 直接复制到子进程，几乎必然导致 CUDA 上下文损坏或文件描述符竞争；forkserver 则让每个工作进程从干净状态启动，只按需初始化自己所需的资源。相较于 `spawn`，forkserver 只需预分叉一次，后续 worker 启动更快，且可以预先加载共享库。每个 Module 运行在独立进程里，任一模块崩溃不会把整个机器人软件栈拖垮。
+
+**`@skill` 与 `@rpc` 分层**的设计来自两个面向不同消费者的接口需求。`@rpc` 方法的调用者是其他 Module 或框架代码，它们是 Python 进程，可以直接处理 `bool`、`PoseStamped` 等原生类型，保留类型信息对编译器检查和序列化都有意义。`@skill` 方法的调用者是语言模型，它只能理解 JSON 参数和纯文本返回值——强制 `str` 返回确保 Agent 总能收到有意义的人类可读反馈，而不是 `None` 或二进制对象。两层分离还带来一个额外好处：一个 Module 可以有许多内部 `@rpc` 方法供其他 Module 调用，但只向 LLM 暴露经过精心设计、有完整文档的 `@skill` 子集。
 
 ### § 2. 通信骨架
 
