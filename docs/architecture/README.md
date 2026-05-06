@@ -260,9 +260,7 @@ dimos/protocol/
 └── tf/            # 坐标变换（ROS tf2 桥接）
 ```
 
-值得注意的是 `rpc/spec.py` 中的 `Spec` Protocol 模式：这是 AGENTS.md 推荐的新式 RPC 接线方式，以 Python `Protocol` 类型声明依赖，在构建期即可捕获接口不匹配，而不是等到运行时才报错。旧式的 `rpc_calls: list[str]` 方式仍可工作，但静默失败风险更高，新代码应优先使用 `Spec`。
-
-`protocol/pubsub/impl/redispubsub.py` 对应的 Transport 层目前没有专门的 `RedisTransport` 类——Redis pub/sub 是通过更高层的 RPC 机制（`redisrpc.py`）使用，而非直接作为 Stream Transport 暴露。`memory.py` 提供进程内纯内存通道，主要用于单元测试和不需要任何外部 IPC 守护进程的场景。
+`rpc/spec.py` 的 `Spec` Protocol 模式是 AGENTS.md 推荐的新式 RPC 接线方式，以 Python `Protocol` 类型声明依赖，构建期即捕获接口不匹配；旧式 `rpc_calls: list[str]` 仍可工作但静默失败风险更高。注意：`redispubsub.py` 没有对应的 `RedisTransport` 类——Redis pub/sub 通过 `redisrpc.py` 使用；`memory.py` 提供进程内通道，主要用于单元测试。
 
 #### 三层关系图
 
@@ -296,19 +294,19 @@ DimOS 使用 Python 的 `forkserver` 启动上下文（`multiprocessing.get_cont
 # avoids CUDA context corruption issues.
 ```
 
-`fork` 在机器人/GPU 工程场景下有多个不可忽视的失效模式。第一，**CUDA 上下文污染**：父进程一旦初始化了 CUDA（哪怕只是加载了 PyTorch 或 OpenCV），`fork` 之后子进程会继承一个半初始化的 CUDA 上下文副本，后续 CUDA 调用几乎必然崩溃或返回不可预测结果。第二，**GPU 内存映射**：CUDA 的 unified memory 和 device buffer 映射是在父进程地址空间中建立的，`fork` 把整张地址空间的虚拟映射关系复制给子进程，但底层驱动状态无法同步，造成映射悬空。第三，**文件描述符继承**：`fork` 会把父进程所有打开的 socket、管道、LCM fd 原封不动地复制到子进程，导致多个进程同时持有同一个 LCM 多播 socket，收发行为混乱。第四，**GIL 锁状态**：在多线程父进程中调用 `fork` 时，子进程继承了 GIL 的内部锁状态，如果 `fork` 时某个线程正持有 GIL，子进程在单线程模式下永远无法获得 GIL，会立刻死锁。
+`fork` 在机器人/GPU 工程场景下有四类失效模式：**CUDA 上下文污染**（父进程初始化 CUDA 后 fork，子进程继承半初始化上下文，GPU 调用必然崩溃）、**GPU 内存映射悬空**（device buffer 地址映射被复制但驱动状态无法同步）、**文件描述符继承**（LCM 多播 socket 被多个进程同时持有，收发混乱）、**GIL 锁死**（多线程父进程在某线程持有 GIL 时 fork，子进程永远无法获取 GIL）。
 
-`forkserver` 的做法是：主进程启动时预先 fork 出一个干净的"forkserver"守护进程，每次需要新 worker 时向它发请求，由它从自己的干净状态 fork 出子进程，再将模块代码和初始化参数通过 pipe 传入。由于 forkserver 本身从未初始化过 CUDA 或打开过业务 socket，每个 worker 都从真正干净的状态启动。相比 `spawn`（完全重新执行 Python 解释器），`forkserver` 只需在进程启动时预分叉一次，后续 worker 启动速度更快，且可以复用已预加载的共享库。任何一个 Module 崩溃或卡住，最坏结果是那个 worker 进程死掉，不会波及其余 worker 或主守护进程。
+`forkserver` 预先 fork 出干净的守护进程，每次需要 worker 时由它从干净状态 fork 子进程并通过 pipe 传入模块代码，因此每个 worker 都从零 CUDA/socket 状态启动。相比 `spawn`（重新执行解释器）启动更快，任何 worker 崩溃只影响自身，不波及其他 worker。
 
 #### WorkerManager 与 ModuleCoordinator 分工
 
 `WorkerManager`（`dimos/core/worker_manager.py`）与 `ModuleCoordinator`（`dimos/core/module_coordinator.py`）是 DimOS 进程管理层的两个责任分明的角色，不能混淆。
 
-**WorkerManager** 是 worker 进程池的所有者，只关心进程生命周期：启动时创建 `n_workers`（默认值 `2`）个 worker 进程，每个进程运行一个 `_worker_entrypoint` 事件循环等待请求；它持有 `Worker` 对象列表，每次 `deploy()` 调用时选出当前 `module_count` 最小的 worker（最小负载优先分配），将 Module 类和初始化参数序列化后通过 pipe 发给该 worker 进程；worker 侧反序列化后实例化 Module、启动其内部线程。`WorkerManager` 还通过 `deploy_parallel()` 支持多个 Module 的并发部署——先顺序预分配 worker（保证计数准确），再用 `ThreadPoolExecutor` 并发执行跨 pipe 的实际 deploy 请求。
+**WorkerManager** 是 worker 进程池的所有者，只关心进程生命周期：创建 `n_workers`（默认 `2`）个 worker 进程，每次 `deploy()` 时按最小负载分配，将 Module 类和初始化参数通过 pipe 传给 worker，worker 侧实例化并启动内部线程。`deploy_parallel()` 用 `ThreadPoolExecutor` 并发部署多个 Module。
 
-**ModuleCoordinator** 是更高层的编排者，持有 `WorkerManager` 引用并在其上构建 stream 接线逻辑。它读取 Blueprint 中各 Module 的 `In[T]` / `Out[T]` 注解，将匹配的流对连接到同一 Transport 实例，确保消息能在不同 worker 中的 Module 之间流动；同时维护所有已部署 Module 的 `ModuleProxy` 句柄供 `health_check()` 和 `stop()` 使用。
+**ModuleCoordinator** 是更高层的编排者：持有 `WorkerManager` 引用，读取 Blueprint 中各 Module 的 `In[T]` / `Out[T]` 注解，将匹配的流对连接到同一 Transport 实例，并维护所有 `ModuleProxy` 句柄供 `health_check()` 和 `stop()` 使用。
 
-两者分工的关键含义是：**当 `n_workers` 小于 Module 总数时，多个 Module 会共享同一个 worker 进程**。WorkerManager 按最小负载将它们塞到同一个 `_worker_loop`，这些 Module 在该进程内串行处理 pipe 请求（各自有独立线程驱动内部逻辑，但 pipe 通信是串行的）。这在小型部署或测试场景下节省系统资源，但若某 Module CPU 密集，会对同 worker 内其他 Module 的响应延迟产生影响。
+**当 `n_workers` 小于 Module 总数时**，多个 Module 共享同一 worker 进程（最小负载分配的自然结果）。若某 Module CPU 密集，会影响同 worker 内其他 Module 的响应延迟。
 
 #### 进程关系图
 
@@ -344,9 +342,7 @@ Blueprint 显式调用 global_config.update(**overrides) 注入的覆写值
 CLI 标志（dimos run --n-workers 4 等，typer 动态回调写入 global_config）
 ```
 
-五层级联中，**CLI 标志优先级最高**，可以在不修改任何文件的情况下临时调整任何配置项，方便调试。Blueprint 层的覆写（`update()` 调用）则允许特定蓝图固定某些参数（如专用 MCP 端口），不受环境变量干扰。`.env` 文件适合把机器人 IP、API key 等部署级参数版本化但不提交（`.gitignore` 排除），团队成员各自维护本地 `.env`。所有 `GlobalConfig` 字段直接映射到同名环境变量（pydantic-settings 默认大小写不敏感，无前缀）：例如 `ROBOT_IP`、`N_WORKERS`、`SIMULATION` 均可直接覆盖对应字段，CI/容器环境通过注入环境变量即可完成配置，无需改代码。
-
-每次 `GlobalConfig()` 实例化时（程序启动时仅做一次），pydantic-settings 按此顺序解析并合并所有来源。`global_config` 是模块级单例，整个运行期共享同一实例；`update()` 方法允许 Blueprint 在 build 阶段原地修改字段，后续代码感知同一对象上的最新值。
+五层级联中 **CLI 标志优先级最高**，方便临时调试。Blueprint 层的 `update()` 允许特定蓝图固定参数（如 MCP 端口）不受环境变量干扰。`.env` 适合把 `ROBOT_IP`、API key 等部署参数版本化但不提交。所有字段直接映射到同名环境变量（大小写不敏感、无前缀），CI/容器注入环境变量即可完成配置。`global_config` 是模块级单例，程序启动时初始化一次；`update()` 允许 Blueprint 在 build 阶段原地修改字段。
 
 #### Daemon 与 RunRegistry
 
@@ -360,11 +356,11 @@ Daemon 与 RunRegistry 共同提供 DimOS 的"进程生命周期账本"，使 `d
 └── logs/<run-id>/main.jsonl  # 单次运行的结构化日志（structlog JSON Lines）
 ```
 
-**`daemon.py`** 是 double-fork 逻辑与 signal handler 的所在处。`daemonize(log_dir)` 执行标准 Unix double-fork：第一次 fork 脱离前台进程组，`setsid()` 新建会话，第二次 fork 确保进程永不重新获取控制终端；stdin/stdout/stderr 全部重定向到 `/dev/null`，实际日志通过 structlog 的 `FileHandler` 写入 `main.jsonl`。`install_signal_handlers(entry, coordinator)` 注册 `SIGTERM` 和 `SIGINT` 的处理函数：收到信号时先调用 `coordinator.stop()` 优雅关闭所有 worker，再调用 `entry.remove()` 从 RunRegistry 注销自身。
+**`daemon.py`**：执行标准 Unix double-fork（`daemonize(log_dir)`），将 stdin/stdout/stderr 重定向到 `/dev/null`，实际日志由 structlog 写入 `main.jsonl`；`install_signal_handlers` 注册 `SIGTERM`/`SIGINT`，收到信号时调用 `coordinator.stop()` 然后从 RunRegistry 注销。
 
-**`run_registry.py`** 实现注册表的 CRUD 操作。`RunEntry` dataclass 包含 `run_id`、`pid`、`blueprint`、`started_at`、`log_dir`、`grpc_port` 等字段，序列化为 JSON 落盘到 `runs/` 目录。`list_runs(alive_only=True)` 遍历所有 `.json` 条目，对已死亡的进程（`os.kill(pid, 0)` 失败）自动清理过期条目，避免积累僵尸记录。`stop_entry()` 先发 `SIGTERM` 等待 5 秒，超时则升级到 `SIGKILL`，实现 `dimos stop` 命令的优雅停止逻辑。
+**`run_registry.py`**：`RunEntry`（run_id、pid、blueprint、log_dir 等）序列化为 JSON 落盘到 `runs/`；`list_runs(alive_only=True)` 自动清理已死亡进程记录；`stop_entry()` 先发 `SIGTERM`，5 秒后升级 `SIGKILL`。
 
-**`log_viewer.py`** 是 `dimos log` 命令的后端。它按 run-id 在 RunRegistry 中定位对应的 `log_dir`，读取 `main.jsonl`（structlog 写入的 JSON Lines 格式），解析每行 JSON 记录，格式化为 `HH:MM:SS [lvl] logger  event  k=v …` 的可读输出并加 ANSI 颜色（error 红、warning 黄、debug 灰）。`dimos log -f` 模式使用 `follow_log()` 实现 `tail -f` 风格的实时追踪。
+**`log_viewer.py`**：按 run-id 定位 `log_dir`，解析 `main.jsonl` 的 JSON Lines，输出带 ANSI 颜色的可读格式；`-f` 模式做 `tail -f` 风格实时追踪。
 
 #### CLI 命令族
 
@@ -405,7 +401,7 @@ def agent_send(self, message: str) -> str:
     ...
 ```
 
-**两个名字、两层入口、同一动作**：CLI 命令用连字符（shell 习惯），MCP 工具用下划线（Python 函数命名规范）。CLI 内部调用 `call_tool_text("agent_send", ...)` 把消息转发给 MCP 层，再由 MCP 层路由到 agent。写文档时按上下文区分：描述 shell 命令写 `agent-send`，描述 MCP 工具调用写 `agent_send`。新工程师常见错误是在代码里写 `agent-send`（含连字符的字符串），或在 shell 里写 `dimos agent_send`（下划线）——两者均无法工作。
+**两个名字、两层入口、同一动作**：CLI 命令用连字符（shell 习惯），MCP 工具用下划线（Python 命名规范）。CLI 内部调用 `call_tool_text("agent_send", ...)` 转发到 MCP 层。常见错误：在代码里写 `"agent-send"`（连字符），或在 shell 里写 `dimos agent_send`（下划线）——两者均无法工作。
 
 ### § 4. Agent 系统
 
@@ -446,7 +442,7 @@ classDiagram
 
 `dimos/agents_deprecated/` 是历史遗留包，包含旧式 OpenAI/Claude agent 实现（`agent.py` 定义了 `LLMAgent` 和 `OpenAIAgent`，还有 `claude_agent.py`、`memory/`、`modules/`、`prompt_builder/`、`tokenizer/` 等子包）。目前仓库内 `dimos/web/dimos_interface/api/README.md` 还留有 `from dimos.agents_deprecated.agent import OpenAIAgent` 的过渡性引用。
 
-**新代码中严禁使用 `dimos/agents_deprecated/`**。典型陷阱：新工程师用 `grep -rn "class Agent"` 在仓库中查找 Agent 定义，会同时命中 `dimos/agents/agent.py`（当前）和 `dimos/agents_deprecated/agent.py`（历史），若不加辨别便导入后者，会引入已废弃的 API、额外的依赖树，且在运行时与当前 Module/Blueprint 体系完全不兼容——错误往往在调用 `start()` 或尝试加入 blueprint 时才爆发，难以定位。判断方法：检查文件路径是否含 `_deprecated` 路径片段，或类是否继承 `Module`（当前体系）而非直接管理 OpenAI 客户端（旧体系）。
+**新代码中严禁使用 `dimos/agents_deprecated/`**。典型陷阱：`grep -rn "class Agent"` 会同时命中 `dimos/agents/agent.py`（当前）和 `dimos/agents_deprecated/agent.py`（历史），误导入后者引入已废弃 API，在调用 `start()` 或加入 blueprint 时才报错。判断方法：检查路径是否含 `_deprecated`，或类是否继承 `Module`（当前体系）。
 
 #### 关键避坑（命名重叠 4）：两套 skills 体系
 
@@ -477,7 +473,7 @@ classDiagram
 - **`dimos/skills/unitree/unitree_speak.py`**：Unitree 平台（Go2/G1）专属 speak 实现，使用 Unitree SDK 的 TTS 接口。
 - **`dimos/agents/skills/speak_skill.py`**：作为独立 Module 的 speak 技能容器，当前标准 agentic blueprint（`_common_agentic`）实际引入的正是这个文件。
 
-使用前必须确认目标平台和调用上下文。直接 import 错误版本不会在 import 时报错，但在运行时会调用到错误的底层接口，或在非 Unitree 平台上因缺少 SDK 而崩溃。判断标准：在 Unitree 平台 blueprint 里直接接入 Unitree TTS 用 `unitree/unitree_speak.py`；通用 agentic blueprint 中作为独立 Module 提供 LLM 工具调用用 `agents/skills/speak_skill.py`（基于 OpenAI TTS）；其他场景的轻量平台无关 fallback 用 `skills/speak.py`。
+选择原则：Unitree 平台直接接入 Unitree TTS → `unitree/unitree_speak.py`；通用 agentic blueprint 中作为独立 Module 提供 LLM 工具调用 → `agents/skills/speak_skill.py`（基于 OpenAI TTS）；轻量平台无关 fallback → `skills/speak.py`。import 错误版本在运行时才会暴露错误接口或因缺少 SDK 崩溃。
 
 #### `@skill` 4 条硬性规则
 
