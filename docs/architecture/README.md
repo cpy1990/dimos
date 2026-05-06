@@ -409,7 +409,146 @@ def agent_send(self, message: str) -> str:
 
 ### § 4. Agent 系统
 
-<!-- TODO: Task 6 -->
+DimOS 的 agent 层不是单一类，而是一组协作的 Module：自动决策的 `Agent`、视频流推理的 `VLMAgent`、人工介入的 `WebInput`。它们都继承 `Module`，通过类型化 stream 与底层子系统通信，通过 `@skill` 装饰器把动作暴露给 LLM 工具调用图。理解 agent 层的前提是认清它在命名、包边界、文件布局上存在多处重叠陷阱——这正是新工程师最容易踩坑的地方。
+
+#### Agent 体系实际形态
+
+| 类型 | 文件 | 说明 |
+|---|---|---|
+| `Agent` | `dimos/agents/agent.py` | 主智能体类；`Module` 子类；使用 LangGraph + LangChain `create_agent`；默认 `model="gpt-4o"`；`model.startswith("ollama:")` 分支路由到本地 Ollama |
+| `VLMAgent` | `dimos/agents/vlm_agent.py` | 独立的视觉语言模型推理 Module，专门处理视频流输入 |
+| `WebInput` | `dimos/agents/web_human_input.py` | 人工介入 Module（文件名含 `web_human_input`，类名为 `WebInput`）；通过 Web 界面接收人类指令注入对话流 |
+| 工具函数 | `dimos/agents/ollama_agent.py` | **不是类**；只暴露两个函数：`ensure_ollama_model` 和 `ollama_installed`；供 `Agent.__init__` 内部调用 |
+
+```mermaid
+classDiagram
+  class Module {
+    +start() None
+    +stop() None
+  }
+  class Agent {
+    +config.model: str
+    +config.system_prompt: str
+  }
+  class VLMAgent {
+    +config.system_prompt: str
+  }
+  class WebInput {
+  }
+  Module <|-- Agent
+  Module <|-- VLMAgent
+  Module <|-- WebInput
+```
+
+> **Ollama 不是独立子类**：没有 `OllamaAgent` 类。是 `Agent` 读取 `model="ollama:llama3"` 这类前缀，在 `__init__` 里调用 `ensure_ollama_model()` 拉取模型，然后路由到本地 Ollama 推理。`dimos/agents/ollama_agent.py` 只是工具函数文件，新工程师若误以为此文件定义了独立子类，将浪费大量调试时间。
+
+#### 关键避坑（命名重叠 3）：legacy 包 `dimos/agents_deprecated/`
+
+`dimos/agents_deprecated/` 是历史遗留包，包含旧式 OpenAI/Claude agent 实现（`agent.py` 定义了 `LLMAgent` 和 `OpenAIAgent`，还有 `claude_agent.py`、`memory/`、`modules/`、`prompt_builder/`、`tokenizer/` 等子包）。目前仓库内 `dimos/web/dimos_interface/api/README.md` 还留有 `from dimos.agents_deprecated.agent import OpenAIAgent` 的过渡性引用。
+
+**新代码中严禁使用 `dimos/agents_deprecated/`**。典型陷阱：新工程师用 `grep -rn "class Agent"` 在仓库中查找 Agent 定义，会同时命中 `dimos/agents/agent.py`（当前）和 `dimos/agents_deprecated/agent.py`（历史），若不加辨别便导入后者，会引入已废弃的 API、额外的依赖树，且在运行时与当前 Module/Blueprint 体系完全不兼容——错误往往在调用 `start()` 或尝试加入 blueprint 时才爆发，难以定位。判断方法：检查文件路径是否含 `_deprecated` 字段，或类是否继承 `Module`（当前体系）而非直接管理 OpenAI 客户端（旧体系）。
+
+#### 关键避坑（命名重叠 4）：两套 skills 体系
+
+仓库中存在两个 skills 目录，路径相近，功能有交叉：
+
+| 目录 | 主要内容 | 特点 |
+|---|---|---|
+| `dimos/skills/` | `kill_skill.py`、`speak.py`、`visual_navigation_skills.py`、`rest/`（rest.py）、`manipulation/`（6 个 `*_skill.py`）、`unitree/`（unitree_speak.py） | 历史积累 + 平台无关 + Unitree 平台特定的混合 |
+| `dimos/agents/skills/` | `navigation.py`、`person_follow.py`、`speak_skill.py`、`gps_nav_skill.py`、`google_maps_skill_container.py`、`osm.py` | 历史积累 + 第三方服务接入 + 通用目的的混合 |
+
+**诚实结论**：这两个目录的划分是历史形成的，并不存在一条清晰的"通用 vs 专用"分界线。在两者之间选择时，核心原则是**就近放置**——技能放在与其依赖关系最紧密的目录下。Unitree 平台专属技能放 `dimos/skills/unitree/`，依赖第三方地图 API 的技能放 `dimos/agents/skills/`，操控臂相关技能放 `dimos/skills/manipulation/`。详细决策树参见 `agent-stack.md`。
+
+#### 关键避坑（命名重叠 5）：`dimos/skills/manipulation/` ≠ `dimos/manipulation/`
+
+这两个目录名字高度相似，功能却完全不同：
+
+- **`dimos/skills/manipulation/`**：LLM 可调用的技能层。包含 6 个文件，每个都带 `@skill` 装饰器：`abstract_manipulation_skill.py`（抽象基类）、`force_constraint_skill.py`、`manipulate_skill.py`、`pick_and_place.py`、`rotation_constraint_skill.py`、`translation_constraint_skill.py`。这里是 LLM "看到"的操控指令入口。
+
+- **`dimos/manipulation/`**：底层算法与 Module 层。包含 `manipulation_module.py`、`manipulation_interface.py`、`pick_and_place_module.py`、`grasping/`、`planning/`、`control/` 等子系统，负责实际的轨迹规划、抓取计算和控制执行。
+
+两者通过 RPC `Spec` Protocol 连接：`dimos/skills/manipulation/` 里的技能函数声明对 `dimos/manipulation/` 里某个 Module 的依赖，blueprint 在构建时完成注入。误把两个目录混用（例如从 skills 层直接 import manipulation 层的内部算法）会破坏 Module 边界，导致难以测试和难以替换的耦合。
+
+#### 关键避坑（命名重叠 6）：speak 在 3 个不同位置
+
+仓库里有 3 个 speak 相关文件，分属不同层次，不可互换：
+
+- **`dimos/skills/speak.py`**：历史平台无关的 speak 技能实现，直接暴露 `@skill` 方法。
+- **`dimos/skills/unitree/unitree_speak.py`**：Unitree 平台（Go2/G1）专属 speak 实现，使用 Unitree SDK 的 TTS 接口。
+- **`dimos/agents/skills/speak_skill.py`**：作为独立 Module 的 speak 技能容器，当前标准 agentic blueprint（`_common_agentic`）实际引入的正是这个文件。
+
+使用前必须确认目标平台和调用上下文。直接 import 错误版本不会在 import 时报错，但在运行时会调用到错误的底层接口，或在非 Unitree 平台上因缺少 SDK 而崩溃。
+
+#### `@skill` 4 条硬性规则
+
+`@skill` 装饰器定义在 `dimos/agents/annotation.py`。它同时设置 `__rpc__ = True` 和 `__skill__ = True`，把方法暴露给 LLM 工具调用图。以下 4 条规则缺一不可：
+
+1. **docstring 必须存在**：缺少 docstring 导致 schema 生成时抛出 `ValueError`，整个 Module 注册失败，该容器的所有技能从 LLM 视野中消失，且启动时才报错，难以追踪源头。
+
+2. **所有参数必须有类型注解**：缺少注解导致生成的 JSON Schema 中该参数没有 `"type"` 字段，LLM 没有类型信息，调用时可能传入类型错误的值而没有显式报错。支持的参数类型：`str`、`int`、`float`、`bool`、`list[str]`、`list[float]`。
+
+3. **返回类型必须是 `str`**：若方法返回 `None`（或无 `return` 语句），LLM 会收到固定回复 "It has started. You will be updated later."，Agent 无法获知动作是否成功，对话陷入盲目。
+
+4. **不能与 `@rpc` 叠加**：`@skill` 已经隐含了 `@rpc` 的效果。若同时使用 `@skill` 和 `@rpc`，schema 会被错误地二次生成，导致工具描述异常或方法被注册两次。
+
+详细规则与完整示例参见 `AGENTS.md` → "Schema generation rules"。
+
+#### RPC Wiring
+
+技能 Module 需要调用底层 Module（如导航、操控臂）时，必须声明对后者的 RPC 依赖，并让 blueprint 在构建时自动注入。
+
+##### 推荐：Spec Protocol 类型注入
+
+从 `dimos/spec/` 下（`control.py`、`mapping.py`、`nav.py`、`perception.py`、`utils.py`）导入或新建 Protocol 类，声明为模块的类属性，blueprint 在 `autoconnect()` 时按类型自动匹配并注入对应 Module 实例。优势：完全类型化，若没有匹配的 Module 在 blueprint 中，构建时（而非运行时）即报错，IDE 可静态分析。
+
+```python
+from dimos.spec.nav import Nav  # Protocol 定义
+
+class MySkillContainer(Module):
+    _nav: Nav  # blueprint 自动注入实现了 Nav 的 Module
+
+    @skill
+    def go_to(self, x: float, y: float) -> str:
+        """Navigate to coordinates."""
+        self._nav.set_goal(x, y)
+        return f"Navigating to ({x}, {y})"
+```
+
+##### Legacy：`rpc_calls` + `get_rpc_calls(...)`（不推荐）
+
+旧代码用 `rpc_calls: list[str]` 配合 `get_rpc_calls("ClassName.method")` 字符串方式声明依赖。这套方式目前仍能工作，但依赖目标的匹配在运行时才发生：若目标 Module 不存在或名字拼写有误，运行时才会静默失败（调用无响应而非报错）。新代码中禁止使用此方式。
+
+#### 关键避坑（命名重叠 7）：`dimos/spec/` ≠ `dimos/protocol/rpc/spec.py`
+
+两个路径都含 "spec"，但层次和职责截然不同：
+
+| 路径 | 角色 | 使用者 |
+|---|---|---|
+| `dimos/spec/`（目录） | 用户侧 Protocol 定义：`control.py`、`mapping.py`、`nav.py`、`perception.py`、`utils.py` | 在新技能或 Module 中声明 RPC 依赖时 import 这里 |
+| `dimos/protocol/rpc/spec.py`（文件） | RPC 实现层内部辅助：定义 `RPCInspectable`、`RPCClient`、`RPCServer`、`RPCSpec` 等底层 Protocol | 框架内部使用；普通功能开发不需要直接接触 |
+
+新工程师常见错误：在技能文件里 import `dimos.protocol.rpc.spec` 以为这是声明 RPC 依赖的地方——实际上应该 import `dimos.spec.<domain>`。两者混淆不会立即报错，但会绕过 blueprint 的类型匹配机制，导致 RPC 在运行时找不到目标。
+
+#### MCP 三件套
+
+MCP（Model Context Protocol）支持通过外部客户端（如 Claude Desktop）驱动机器人，而非直接在进程内运行 Agent。DimOS 中 MCP 由三个 Module 协作实现，全部定义在 `dimos/agents/mcp/`：
+
+- **`McpServer`**（`mcp_server.py`）：FastAPI HTTP 服务，监听 9990 端口，把 blueprint 中所有 `@skill` 方法注册为 MCP 工具端点。
+- **`McpClient`**（`mcp_client.py`）：进程内 LLM 客户端，连接 McpServer，通过工具调用协议与技能交互。
+- **`McpAdapter`**（`mcp_adapter.py`）：外部调用助手，提供类型化的 Python 接口指向运行中的 MCP 服务；主要供测试和外部集成使用，非运行时必选组件。
+
+**关键约束**：MCP 模式与进程内 `Agent` 模式互斥。在同一 blueprint 中，要么包含 `Agent`（本地 LLM 决策），要么包含 `McpServer` + `McpClient`（外部 MCP 客户端决策），不能同时存在两者。当前仓库中唯一正式发布的 MCP-enabled blueprint 是 `unitree-go2-agentic-mcp`（`dimos/robot/unitree/go2/blueprints/agentic/unitree_go2_agentic_mcp.py`）。新工程师若想在其他 blueprint 中使用 `dimos mcp` 命令，会发现 MCP 服务未启动——因为只有包含 `McpServer` 的 blueprint 才会开放该端点。
+
+#### 系统提示词：Go2 vs G1
+
+Agent 和 VLMAgent 都接受 `system_prompt` 参数。不同机器人平台有不同的技能集，必须匹配对应的系统提示词，否则 LLM 会凭空"幻觉"出不存在的技能名称，或忽略实际可用的技能。
+
+| 机器人 | 文件 | 变量名 |
+|---|---|---|
+| Go2（默认） | `dimos/agents/system_prompt.py` | `SYSTEM_PROMPT` |
+| G1 人形机器人 | `dimos/robot/unitree/g1/system_prompt.py` | `G1_SYSTEM_PROMPT` |
+
+`Agent` 默认使用 `SYSTEM_PROMPT`（Go2 技能集）。在 G1 blueprint 中必须显式传入：`agent(system_prompt=G1_SYSTEM_PROMPT)`。G1 专属 agentic blueprint（`dimos/robot/unitree/g1/blueprints/agentic/_agentic_skills.py`）已正确配置此参数，但若新工程师手动构建 blueprint 时遗漏，LLM 将使用 Go2 提示词——调用 G1 特有动作时幻觉的技能名不存在，调用 Go2 提示词描述的动作时底层 G1 SDK 接口不匹配，调试成本极高。
 
 ### § 5. 机器人平台层
 
