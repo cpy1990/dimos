@@ -30,7 +30,7 @@ DimOS 的核心思路是把这块铁板拆成两个正交维度：
 
 **Module（模块）** 负责所有与硬件相关的运行时能力——感知流水线（摄像头、激光雷达、语音）、空间记忆与建图、导航与规划、运动控制与电机驱动。每个 Module 通过类型化 Stream 发布和消费数据；Stream 底层可以是 LCM、ROS2、DDS 或内存管道，对上层透明。多个 Module 被 Blueprint（蓝图）编排成可直接运行的机器人软件栈，一行 `dimos run <blueprint>` 即可启动。
 
-**Agent（智能体）** 负责高层决策。它订阅 Module 暴露的 Stream、调用 Module 注册的 Skill（技能函数），用自然语言驱动机器人行为。用户可以通过 CLI（`dimos agent-send`）、Web UI、MCP 客户端或 Teleop 控制器向 Agent 下指令；Agent 将指令映射为 Skill 调用序列并反馈结果。无需修改底层 Module，只需更换或扩展 Skill，机器人的行为边界就随之改变。
+**Agent（智能体）** 负责高层决策。它订阅 Module 暴露的 Stream、调用 Module 注册的 Skill（技能函数），用自然语言驱动机器人行为。用户可以通过 CLI（`dimos agent-send`）、Web UI 或 MCP 客户端向 Agent 下指令，由 Agent 翻译成 Skill 调用；Teleop 则绕过 Agent，直接以人手操作驱动 Module。无需修改底层 Module，只需更换或扩展 Skill，机器人的行为边界就随之改变。
 
 ```mermaid
 flowchart LR
@@ -48,7 +48,7 @@ flowchart LR
 >
 > - `AGENTS.md` — quick-start cheat-sheet 与必踩坑清单（命令速查、blueprint 表、`@skill` 规则、预提交钩子）；**事实之源**，有疑问先看这里。
 > - `CLAUDE.md` — AI 代理工作护栏；指向 `AGENTS.md`，附加少量 Claude 专用约束（不重复 AGENTS.md 内容）。
-> - 本架构文档 — 系统全景与设计取舍；新工程师通读后无需跳转即可建立完整心智模型。
+> - 本架构文档 — 系统全景与设计取舍。
 >
 > 三者交叉引用，不重复。如需修改某条规则，只在其"主权"文档里改，其余文档只做引用。
 
@@ -57,8 +57,8 @@ flowchart LR
 ```text
 dimos/                    # 仓库根
 ├── dimos/                # 主 Python 包（所有运行时代码）
-├── bin/                  # 安装/启动脚本（如 bin/pytest-slow）
-├── scripts/              # 仓库级运维脚本（发布、CI 辅助等）
+├── bin/                  # CI/开发辅助脚本（如 bin/pytest-slow）
+├── scripts/              # 安装与运维辅助脚本
 ├── data/                 # 示例 / replay 数据集
 ├── docker/               # 容器构建上下文
 ├── examples/             # 跑得起来的示例代码
@@ -67,7 +67,8 @@ dimos/                    # 仓库根
 ├── pyproject.toml        # 项目元数据 + 依赖声明
 ├── setup.py              # 兼容 setuptools 入口（保留兼容）
 ├── uv.lock               # uv 锁定文件
-├── flake.nix / flake.lock # Nix 复现构建定义
+├── flake.nix             # Nix flake 定义
+├── flake.lock            # Nix 锁定
 ├── default.env           # 默认环境变量
 ├── MANIFEST.in           # 打包清单
 ├── LICENSE               # 许可证
@@ -81,13 +82,13 @@ dimos/                    # 仓库根
 |---|---|
 | `dimos/` | 主 Python 包：所有运行时代码 |
 | `bin/` | shell 包装（如 `bin/pytest-slow` 跑全套测试） |
-| `scripts/` | 运维脚本：发布、CI 辅助等 |
+| `scripts/` | 安装与运维辅助脚本（目前主要是 `install.sh`） |
 | `data/` | 示例数据、replay 数据集 |
 | `docker/` | Docker 构建文件 |
 | `examples/` | 跑得起来的示例 |
 | `assets/` | 图标、静态资源 |
 | `docs/` | 文档：本文件所在 |
-| `pyproject.toml` | uv/Poetry 元数据 + 依赖声明 |
+| `pyproject.toml` | 项目元数据 + 依赖声明（setuptools 构建后端，uv 管理依赖） |
 | `setup.py` | 旧式 setuptools 入口（保留兼容） |
 | `uv.lock` | uv 锁定 |
 | `flake.nix` / `flake.lock` | Nix 复现构建 |
@@ -99,7 +100,7 @@ dimos/                    # 仓库根
 | `CLAUDE.md` | Claude Code 工作护栏 |
 | `AGENTS.md` | AI agent onboarding（事实之源） |
 
-> `dimos/utils/` 是 30+ 个横切工具（`logging_config` / `llm_utils` /
+> `dimos/utils/` 是 20 来个横切工具模块（`logging_config` / `llm_utils` /
 > `transform_utils` / `gpu_utils` / `threadpool` / `urdf` 等），被几乎所有
 > 子系统依赖。本文档不展开；需要时直接读源码。
 
