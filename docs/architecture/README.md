@@ -110,7 +110,7 @@ DimOS 的所有运行代码都围绕三个抽象组装：**Module / Blueprint / 
 
 #### Module —— 自治子系统
 
-Module 是 DimOS 最基础的运行单元。每个 Module 是一个继承自 `Module` 基类的 Python 类，代表一个独立的、可组合的能力模块——例如摄像头驱动、目标检测、导航规划或运动控制。Module 运行在独立的 forkserver 工作进程中，与主进程和其他 Module 物理隔离；进程间通过 LCM 消息总线或共享内存进行通信。
+Module 是 DimOS 最基础的运行单元。每个 Module 是一个继承自 `Module` 基类的 Python 类，代表一个独立的、可组合的能力模块——例如摄像头驱动、目标检测、导航规划或运动控制。Module 运行在 forkserver 工作进程中，与主进程隔离；多个 Module 之间默认按 worker 池调度（详见 §3）；进程间通过 LCM 消息总线或共享内存进行通信。
 
 Module 的数据接口通过类型注解声明：`In[T]` 表示输入流，`Out[T]` 表示输出流，`T` 是实际消息类型（如 `Image`、`PoseStamped`、`Twist`）。声明即接口——Blueprint 在构建时会读取这些注解，自动按 `(名称, 类型)` 匹配并连接各 Module 的流。流的底层传输是可替换的（LCM / ROS2 / DDS / 内存管道），Module 本身不感知传输细节。
 
@@ -122,15 +122,15 @@ Blueprint 是一张描述"哪些 Module 共同构成这台机器人软件栈"的
 
 `autoconnect(*blueprints)` 是拼装的核心：它接受多个 Module 级或 Blueprint 级蓝图，去重合并后返回一个新的 `Blueprint`。构建阶段（`.build()`）会为每个 Module 启动 forkserver 工作进程，然后扫描所有模块的 `In[T]` / `Out[T]` 注解，凡 `(名称, 类型)` 完全匹配的流对，自动共享同一个传输层实例——这就是"自动连线"。
 
-若两个 Module 恰好有同名但含义不同的流，可以用 `.remappings([(ModuleA, "old_name", "new_name"), ...])` 解决命名冲突，将某个 Module 的特定流改名后再参与匹配。Module 之间的 RPC 引用则通过 `Spec` Protocol 注解在编译时绑定，找不到匹配实现会在 build 阶段直接报错，而不是在运行时静默失败。
+若两个 Module 恰好有同名但含义不同的流，可以用 `.remappings([(ModuleA, "old_name", "new_name"), ...])` 解决命名冲突，将某个 Module 的特定流改名后再参与匹配。Module 之间的 RPC 引用则通过 `Spec` Protocol 注解在构建期（`.build()`）绑定，找不到匹配实现会在 build 阶段直接报错，而不是在运行时静默失败。
 
 #### Skill —— 智能体可调用的动作
 
 Skill 是 Agent 能调用的物理动作函数，定义在继承自 `Module` 的 Skill 容器类里。`@skill` 装饰器（`dimos/agents/annotation.py`）同时设置 `__rpc__ = True` 和 `__skill__ = True`：前者让该方法可以被跨进程 RPC 调用，后者让框架在注册时自动把函数签名和文档字符串转换成 LLM 工具调用所需的 JSON schema。
 
-`@skill` 与 `@rpc` 在职责上是两个不同的层面：`@rpc` 是 Module 内部 / Module 间的过程调用面，保留原始 Python 返回类型；`@skill` 是 LLM 向外暴露的工具接口，**必须返回 `str`**，因为语言模型只消费文本。因此，不要将两者叠加使用——`@skill` 已经蕴含了 `@rpc`。`@skill` 函数还有三条硬性规则：必须有文档字符串、所有参数必须类型注解、返回值必须是 `str`；违反任意一条都会导致模块注册失败或 LLM schema 缺失（详见 §4）。
+`@skill` 与 `@rpc` 在职责上是两个不同的层面：`@rpc` 是 Module 内部 / Module 间的过程调用面，保留原始 Python 返回类型；`@skill` 是 LLM 向外暴露的工具接口，**必须返回 `str`**，因为语言模型只消费文本。因此，不要将两者叠加使用——`@skill` 已经蕴含了 `@rpc`。`@skill` 函数还有几条硬性规则：必须有文档字符串、所有参数必须类型注解、返回值必须是 `str`；完整规则见 §4，违反任意一条都会导致模块注册失败或 LLM schema 缺失。
 
-#### 三者关系（类图）
+#### 关系图（类图）
 
 ```mermaid
 classDiagram
@@ -147,8 +147,9 @@ classDiagram
     +remappings()
     +build() ModuleCoordinator
   }
-  class Skill {
-    +@skill function
+  class SkillContainer {
+    «Module subclass»
+    +@skill methods
     +returns str
     +auto JSON schema
   }
@@ -157,9 +158,8 @@ classDiagram
     +LLM tool calls
   }
   Blueprint o-- Module : 包含并编排
-  Module <|-- SkillContainer : Skill 定义在\nModule 子类中
-  Skill --* SkillContainer : @skill 方法
-  Agent ..> Skill : 通过 Spec Protocol\n引用 RPC 面
+  Module <|-- SkillContainer : Skill 容器是\nModule 子类
+  Agent ..> SkillContainer : 通过 Spec Protocol\n引用 @skill 方法
 ```
 
 #### 最小可运行 Blueprint 片段
@@ -167,13 +167,17 @@ classDiagram
 ```python
 from dimos.core.module import Module
 from dimos.core.stream import In, Out
-from dimos.core.core import rpc; from dimos.agents.annotation import skill
-from dimos.core.blueprints import autoconnect; from dimos.msgs.geometry_msgs import Twist
+from dimos.core.core import rpc
+from dimos.agents.annotation import skill
+from dimos.core.blueprints import autoconnect
+from dimos.msgs.geometry_msgs import Twist
 class DriveModule(Module):    # ① Module：类型化流 + @rpc 调用面
     cmd_vel: In[Twist]
+    velocity_feedback: Out[Twist]
     @rpc
     def start(self) -> None:
-        self.cmd_vel.subscribe(self._process)
+        super().start()
+        self.cmd_vel.subscribe(self._process)  # 实现略
 class Skills(Module):         # ② Skill：@skill 向 LLM 暴露工具 schema
     @skill
     def move(self, speed: float = 0.5) -> str:
