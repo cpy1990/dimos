@@ -942,7 +942,157 @@ dimos/skills/manipulation/
 
 **详细参考**：[`docs/capabilities/manipulation/`](../../docs/capabilities/manipulation/)，`dimos/manipulation/planning/README.md`。
 
-<!-- TODO: Tasks 9-10 (subsystems 5-13) -->
+#### 5. mapping/ — 占用栅格 / Voxel / 代价地图
+
+**职责**：构建并维护环境的空间表示，供导航与规划使用。`mapping/` 提供多种并行表示：二维占用栅格（`occupancy/`）用于平面导航，三维体素地图（`voxels.py`）用于立体感知，代价地图（`costmapper.py`）将语义与障碍物叠加为可规划代价层，`osm/` 和 `google_maps/` 接入开放街道图与卫星底图，`pointclouds/` 处理来自激光雷达的点云并将其投影为占用表示。
+
+**关键文件**：
+
+```text
+dimos/mapping/
+├── costmapper.py         # 代价地图生成，融合多源障碍物层
+├── voxels.py             # 三维体素栅格
+├── types.py              # 共享数据类型定义
+├── occupancy/            # 二维占用栅格：膨胀、梯度、路径掩码等
+├── pointclouds/          # 激光雷达点云 → 占用投影
+├── osm/                  # OpenStreetMap 查询与当前位置地图
+├── google_maps/          # Google Maps 瓦片底图集成
+└── utils/                # 距离等通用工具
+```
+
+**主要 stream**
+
+| 方向 | Stream 类型 | 说明 |
+|------|-------------|------|
+| 输入 | `LaserScan` / `PointCloud2` | 来自 robot/ 或 perception/ 的传感器数据 |
+| 输出 | `OccupancyGrid` | 发布至导航规划层 |
+| 输出 | `Costmap` | 供 control/ 的路径规划器使用 |
+
+**设计取舍**
+
+- **多表示并存**：占用栅格、体素、代价地图三套表示在运行时同时存在，并非只保留一种。不同任务选择最合适的表示：平面导航用二维栅格，避障检测用三维体素，路径优化用代价地图。多表示带来冗余维护成本，但让各下游模块可独立消费最适合的格式。
+- **OSM/Google Maps 作为底图**：在室外或大范围场景中，`osm/` 和 `google_maps/` 提供先验地图骨架，点云与激光雷达更新局部细节，两者叠加而非替代。
+
+**详细参考**：[`docs/capabilities/`](../../docs/capabilities/)，`dimos/mapping/osm/README.md`。
+
+---
+
+#### 6. memory/ — 空间嵌入与时序数据
+
+**职责**：为跨 Module 的"事实记忆"提供持久化存储底层。`memory/` 不直接感知外部环境，而是被 agents 和 skills 通过 RPC 调用，储存并检索两类数据：带语义向量的空间条目（embedding）以及时间序列事件流。
+
+**关键文件**：
+
+```text
+dimos/memory/
+├── embedding.py              # 空间条目存储，每条记录附带 embedding 向量，支持语义检索
+└── timeseries/               # 可插拔时序 backend
+    ├── base.py               # 抽象接口（TimeSeries）
+    ├── inmemory.py           # 单机内存 backend，零依赖，适合测试与轻量部署
+    ├── pickledir.py          # 文件系统持久化，按时间戳分目录存 pickle
+    ├── sqlite.py             # SQLite backend，单文件、可移植
+    ├── postgres.py           # PostgreSQL backend，适合集群/多机部署
+    └── legacy.py             # 旧版兼容 backend（过渡期保留）
+```
+
+**主要 stream**
+
+`memory/` 本身不订阅或发布 ROS/stream 消息。它是被动存储层：agents 的 @skill 或 @rpc 方法在需要时调用 `embedding.py` 写入/检索空间条目，调用 `timeseries/` 记录或查询事件历史。
+
+**设计取舍**
+
+- **spatial vs timeseries 双轨**：`embedding.py` 解决"机器人刚才看到了什么"——以语义向量索引空间观测，支持近似最近邻检索；`timeseries/` 解决"过去 N 秒发生了什么"——按时间顺序追加事件，支持滑动窗口查询。两套接口差异明显，统一放在 `memory/` 下是为了给上层提供单一的"记忆入口"。
+- **backend 可插拔**：`timeseries/` 通过 `base.py` 定义统一接口，`inmemory`（测试/轻量）、`pickledir`（单机持久化）、`sqlite`（单文件生产）、`postgres`（集群）四种实现可在 Blueprint 层配置切换，不修改业务代码。
+
+> **关键避坑（命名重叠 8）**：DimOS 的 **temporal memory** 不在 `dimos/memory/`，而在 `dimos/perception/experimental/temporal_memory/`（PR #1511 引入）。两者不要混淆：`memory/` 是稳定的存储底层，`temporal_memory/` 是感知侧的 spatio-temporal RAG 实验，其输入来自视频帧而非 RPC 调用。
+
+**详细参考**：[`docs/capabilities/`](../../docs/capabilities/) + PR #1511。
+
+---
+
+#### 7. models/ — ML 模型封装
+
+**职责**：集中管理机器人系统中所有 ML 推理模型的加载与调用接口，包括视觉语言模型（VLM）、语义分割、图像/文本嵌入，以及针对 Qwen 的视频查询封装。`models/` 是被动调用层，不主动订阅 stream，由 `perception/` 各模块或 Agent skill 在需要时直接方法调用。
+
+**关键文件**：
+
+```text
+dimos/models/
+├── base.py               # 所有模型的基类，统一加载与推理接口
+├── vl/                   # 视觉语言模型（VLM）封装
+│   ├── base.py           # VLM 抽象接口
+│   ├── qwen.py           # Qwen-VL 本地推理
+│   ├── florence.py       # Florence-2 封装
+│   ├── moondream.py      # Moondream 本地推理
+│   ├── moondream_hosted.py # Moondream 托管 API
+│   └── openai.py         # OpenAI Vision API 适配器
+├── embedding/            # 图像/文本嵌入模型
+│   ├── base.py           # 嵌入接口抽象
+│   ├── clip.py           # CLIP 嵌入
+│   ├── mobileclip.py     # MobileCLIP 轻量嵌入
+│   └── treid.py          # ReID 特征提取
+├── segmentation/         # 语义分割
+│   └── edge_tam.py       # EdgeTAM 分割封装
+└── qwen/                 # Qwen 专项工具
+    ├── bbox.py           # 边界框后处理
+    └── video_query.py    # 视频时序查询
+```
+
+**主要 stream**
+
+`models/` 无顶层 stream 订阅或发布。`perception/` 中的模块实例化具体模型类，并在 tick 或 RPC 调用中直接调用推理方法；Agent skill 也可通过 RPC 获取模型输出。
+
+**设计取舍**
+
+- **共享加载，不重复初始化**：`perception/` 的多个 Module（如 `VideoPerception`、`ObjectDetection`）可复用同一个已加载的模型实例，避免在同一进程中多次加载大权重文件，减少显存占用。
+- **统一接口，多后端可替换**：`vl/base.py` 定义统一的 `caption()`、`query()` 等方法，Qwen / Florence / Moondream / OpenAI 均实现相同签名，Blueprint 层只需改配置即可切换推理后端，业务代码无需修改。
+- **轻量嵌入优先边缘**：`embedding/mobileclip.py` 专门提供面向边缘计算的轻量嵌入，与完整 CLIP 共享接口，让相同的 `memory/embedding.py` 代码在边缘与云端均可运行。
+
+**详细参考**：代码内 `dimos/models/vl/README.md`，以及各模型目录下的测试文件（`test_models.py`、`test_vlm.py` 等）。模型选择对推理延迟与精度影响显著，建议在目标硬件上先用 `demo_` 前缀脚本做基准测试。
+
+---
+
+#### 8. web/ — FastAPI + WebSocket 命令中心
+
+**职责**：提供面向操作员的 Web 界面与 API 网关。`web/` 将外部 HTTP/WebSocket 请求翻译为 Agent 命令，同时将机器人状态与传感器画面实时推送至浏览器。它是人机交互的唯一入口，与 Agent 及 Module 之间通过 RPC 通信，自身不包含业务逻辑。
+
+**关键文件**：
+
+```text
+dimos/web/
+├── fastapi_server.py         # FastAPI HTTP 端点，REST API 入口
+├── flask_server.py           # Flask 兼容接口（遗留/并行）
+├── edge_io.py                # 边缘设备 I/O 桥接
+├── robot_web_interface.py    # 机器人 Web 控制接口，封装常用控制命令
+├── command-center-extension/ # 浏览器扩展（Vite + TypeScript），操作员命令中心 UI
+├── dimos_interface/          # 主 Web 前端（Svelte + Tailwind），完整控制台
+├── websocket_vis/            # WebSocket 可视化服务
+│   ├── websocket_vis_module.py  # 推送代价地图、路径等实时数据至浏览器
+│   ├── costmap_viz.py           # 代价地图可视化渲染
+│   └── path_history.py          # 路径历史轨迹推送
+└── templates/                # Jinja2 / 静态 HTML 模板
+```
+
+**主要 stream**
+
+| 方向 | 通道 | 说明 |
+|------|------|------|
+| 输入 | HTTP POST / WebSocket | 操作员指令，经 `fastapi_server.py` 路由至 Agent RPC |
+| 输出 | WebSocket 推送 | 代价地图、路径、视频帧等实时数据，由 `websocket_vis/` 推送至前端 |
+| 双向 | Agent RPC | `web/` 调用 Agent @rpc 传递命令；Agent 回调更新状态 |
+
+**设计取舍**
+
+- **Web 层与 Agent 解耦**：`web/` 不直接操控机器人，只负责将用户输入转为 RPC 调用，由 Agent 决策并下发到 control/。这一分层让 Web 界面可在 Agent 不可达时优雅降级，也便于单独对 Web 层做压测和替换。
+- **双前端并存**：`command-center-extension/`（浏览器扩展，TypeScript）与 `dimos_interface/`（独立 Svelte 应用）服务不同场景——前者嵌入现有浏览器工作流，后者作为独立全屏控制台部署。两者共享后端 API 但 UI 完全独立。
+- **WebSocket 实时可视化独立服务化**：`websocket_vis/` 作为独立 Module 运行，订阅 mapping/ 的代价地图和路径数据，不与 HTTP 服务混用同一进程，确保实时推送不受 REST 请求阻塞。
+- **FastAPI + Flask 并存**：`fastapi_server.py` 是主推路径（异步、类型安全），`flask_server.py` 保留以兼容遗留集成和第三方插件，新功能应优先在 FastAPI 层实现。
+
+**详细参考**：[`docs/capabilities/`](../../docs/capabilities/)。
+
+---
+
+<!-- TODO: Task 10 (subsystems 9-13) -->
 
 ### § 7. 端到端数据流
 
