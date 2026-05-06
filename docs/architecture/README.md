@@ -446,7 +446,7 @@ classDiagram
 
 `dimos/agents_deprecated/` 是历史遗留包，包含旧式 OpenAI/Claude agent 实现（`agent.py` 定义了 `LLMAgent` 和 `OpenAIAgent`，还有 `claude_agent.py`、`memory/`、`modules/`、`prompt_builder/`、`tokenizer/` 等子包）。目前仓库内 `dimos/web/dimos_interface/api/README.md` 还留有 `from dimos.agents_deprecated.agent import OpenAIAgent` 的过渡性引用。
 
-**新代码中严禁使用 `dimos/agents_deprecated/`**。典型陷阱：新工程师用 `grep -rn "class Agent"` 在仓库中查找 Agent 定义，会同时命中 `dimos/agents/agent.py`（当前）和 `dimos/agents_deprecated/agent.py`（历史），若不加辨别便导入后者，会引入已废弃的 API、额外的依赖树，且在运行时与当前 Module/Blueprint 体系完全不兼容——错误往往在调用 `start()` 或尝试加入 blueprint 时才爆发，难以定位。判断方法：检查文件路径是否含 `_deprecated` 字段，或类是否继承 `Module`（当前体系）而非直接管理 OpenAI 客户端（旧体系）。
+**新代码中严禁使用 `dimos/agents_deprecated/`**。典型陷阱：新工程师用 `grep -rn "class Agent"` 在仓库中查找 Agent 定义，会同时命中 `dimos/agents/agent.py`（当前）和 `dimos/agents_deprecated/agent.py`（历史），若不加辨别便导入后者，会引入已废弃的 API、额外的依赖树，且在运行时与当前 Module/Blueprint 体系完全不兼容——错误往往在调用 `start()` 或尝试加入 blueprint 时才爆发，难以定位。判断方法：检查文件路径是否含 `_deprecated` 路径片段，或类是否继承 `Module`（当前体系）而非直接管理 OpenAI 客户端（旧体系）。
 
 #### 关键避坑（命名重叠 4）：两套 skills 体系
 
@@ -454,7 +454,7 @@ classDiagram
 
 | 目录 | 主要内容 | 特点 |
 |---|---|---|
-| `dimos/skills/` | `kill_skill.py`、`speak.py`、`visual_navigation_skills.py`、`rest/`（rest.py）、`manipulation/`（6 个 `*_skill.py`）、`unitree/`（unitree_speak.py） | 历史积累 + 平台无关 + Unitree 平台特定的混合 |
+| `dimos/skills/` | `skills.py`（`SkillLibrary` 注册中心与 `AbstractSkill` 基类）、`kill_skill.py`、`speak.py`、`visual_navigation_skills.py`、`rest/`（rest.py）、`manipulation/`（6 个 `*_skill.py`）、`unitree/`（unitree_speak.py） | 历史积累 + 平台无关 + Unitree 平台特定的混合 |
 | `dimos/agents/skills/` | `navigation.py`、`person_follow.py`、`speak_skill.py`、`gps_nav_skill.py`、`google_maps_skill_container.py`、`osm.py` | 历史积累 + 第三方服务接入 + 通用目的的混合 |
 
 **诚实结论**：这两个目录的划分是历史形成的，并不存在一条清晰的"通用 vs 专用"分界线。在两者之间选择时，核心原则是**就近放置**——技能放在与其依赖关系最紧密的目录下。Unitree 平台专属技能放 `dimos/skills/unitree/`，依赖第三方地图 API 的技能放 `dimos/agents/skills/`，操控臂相关技能放 `dimos/skills/manipulation/`。详细决策树参见 `agent-stack.md`。
@@ -477,13 +477,13 @@ classDiagram
 - **`dimos/skills/unitree/unitree_speak.py`**：Unitree 平台（Go2/G1）专属 speak 实现，使用 Unitree SDK 的 TTS 接口。
 - **`dimos/agents/skills/speak_skill.py`**：作为独立 Module 的 speak 技能容器，当前标准 agentic blueprint（`_common_agentic`）实际引入的正是这个文件。
 
-使用前必须确认目标平台和调用上下文。直接 import 错误版本不会在 import 时报错，但在运行时会调用到错误的底层接口，或在非 Unitree 平台上因缺少 SDK 而崩溃。
+使用前必须确认目标平台和调用上下文。直接 import 错误版本不会在 import 时报错，但在运行时会调用到错误的底层接口，或在非 Unitree 平台上因缺少 SDK 而崩溃。判断标准：在 Unitree 平台 blueprint 里直接接入 Unitree TTS 用 `unitree/unitree_speak.py`；通用 agentic blueprint 中作为独立 Module 提供 LLM 工具调用用 `agents/skills/speak_skill.py`（基于 OpenAI TTS）；其他场景的轻量平台无关 fallback 用 `skills/speak.py`。
 
 #### `@skill` 4 条硬性规则
 
-`@skill` 装饰器定义在 `dimos/agents/annotation.py`。它同时设置 `__rpc__ = True` 和 `__skill__ = True`，把方法暴露给 LLM 工具调用图。以下 4 条规则缺一不可：
+`@skill` 装饰器定义在 `dimos/agents/annotation.py`。它同时设置 `__rpc__ = True` 和 `__skill__ = True`，把方法暴露给 LLM 工具调用图。（§1 已在最小蓝图片段中介绍 `@skill` 的基本用法；本节列出所有硬性规则。）以下 4 条规则缺一不可：
 
-1. **docstring 必须存在**：缺少 docstring 导致 schema 生成时抛出 `ValueError`，整个 Module 注册失败，该容器的所有技能从 LLM 视野中消失，且启动时才报错，难以追踪源头。
+1. **docstring 必须存在**：缺少 docstring 会让 LangChain 在第一次 `get_skills()` 时抛 `ValueError`——错误**首次执行技能查询时才暴露**，而非启动时；调试时易被误判为运行时随机失败。
 
 2. **所有参数必须有类型注解**：缺少注解导致生成的 JSON Schema 中该参数没有 `"type"` 字段，LLM 没有类型信息，调用时可能传入类型错误的值而没有显式报错。支持的参数类型：`str`、`int`、`float`、`bool`、`list[str]`、`list[float]`。
 
@@ -531,11 +531,11 @@ class MySkillContainer(Module):
 
 #### MCP 三件套
 
-MCP（Model Context Protocol）支持通过外部客户端（如 Claude Desktop）驱动机器人，而非直接在进程内运行 Agent。DimOS 中 MCP 由三个 Module 协作实现，全部定义在 `dimos/agents/mcp/`：
+MCP（Model Context Protocol）提供标准化的工具调用协议，**两种使用模式都支持**：（a）外部客户端（如 Claude Desktop）通过 HTTP 直接调用 `McpServer` 暴露的技能；（b）进程内 `McpClient` 作为 Module 在同一 blueprint 进程中执行 LLM 推理并调用同进程的 `McpServer`。**DimOS 当前发布的 MCP blueprint（`unitree-go2-agentic-mcp`）采用 (b) 进程内模式**——`McpClient` 与 `McpServer` 共存于一个 blueprint 进程；外部客户端模式是协议层支持但目前未直接 ship 的形态。DimOS 中 MCP 由两个 Module 加一个辅助类协作实现，全部定义在 `dimos/agents/mcp/`：
 
 - **`McpServer`**（`mcp_server.py`）：FastAPI HTTP 服务，监听 9990 端口，把 blueprint 中所有 `@skill` 方法注册为 MCP 工具端点。
 - **`McpClient`**（`mcp_client.py`）：进程内 LLM 客户端，连接 McpServer，通过工具调用协议与技能交互。
-- **`McpAdapter`**（`mcp_adapter.py`）：外部调用助手，提供类型化的 Python 接口指向运行中的 MCP 服务；主要供测试和外部集成使用，非运行时必选组件。
+- **`McpAdapter`**（`mcp_adapter.py`）：**普通 Python 类（非 Module）**，提供面向 Python 调用方的类型化接口，封装对运行中 MCP server 的 HTTP 调用；主要供测试 / 外部集成使用，非运行时必选组件。
 
 **关键约束**：MCP 模式与进程内 `Agent` 模式互斥。在同一 blueprint 中，要么包含 `Agent`（本地 LLM 决策），要么包含 `McpServer` + `McpClient`（外部 MCP 客户端决策），不能同时存在两者。当前仓库中唯一正式发布的 MCP-enabled blueprint 是 `unitree-go2-agentic-mcp`（`dimos/robot/unitree/go2/blueprints/agentic/unitree_go2_agentic_mcp.py`）。新工程师若想在其他 blueprint 中使用 `dimos mcp` 命令，会发现 MCP 服务未启动——因为只有包含 `McpServer` 的 blueprint 才会开放该端点。
 
