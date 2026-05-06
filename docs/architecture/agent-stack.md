@@ -1,21 +1,577 @@
 # 专题：Agent 栈（Agent Stack）
 
 > 与 [README § 4](README.md#-4-agent-系统) 配套深入：Agent 内部循环、@skill schema、双 skills 决策树、Spec、MCP、agent 变种。
+> 目标读者：正在编写新 skill、集成新 LLM、或组合 MCP-enabled blueprint 的工程师。
 
 ## 目录
 
 - [1. Agent 内部循环](#1-agent-内部循环)
 - [2. @skill schema 生成](#2-skill-schema-生成)
 - [3. 双 skills 对比与决策树](#3-双-skills-对比与决策树)
-- [4. Spec Protocol 与 RPC](#4-spec-protocol-与-rpc)
+- [4. Spec Protocol 与编译期类型检查](#4-spec-protocol-与编译期类型检查)
 - [5. MCP 三件套](#5-mcp-三件套)
 - [6. Agent 变种清单](#6-agent-变种清单)
 
-<!-- TODO: Task 14 -->
+---
+
+## 1. Agent 内部循环
+
+### 1.1 从 `on_system_modules` 到 LangGraph
+
+`Agent`（`dimos/agents/agent.py`）继承自 `Module`，是整个智能体栈的核心。它的生命周期从 `on_system_modules` RPC 回调开始：系统启动后，框架会调用此方法并传入所有已就绪的模块代理列表（`list[RPCClient]`）。在该方法内，框架做以下三件事：
+
+1. **模型路由**：检查 `config.model` 是否以 `"ollama:"` 开头。若是，则从 `dimos/agents/ollama_agent.py` 调用 `ensure_ollama_model()` 确保模型已在本地 Ollama 守护进程中拉取完毕。默认模型为 `gpt-4o`。
+2. **工具装载**：调用 `_get_tools_from_modules(self, modules, self.rpc)`，遍历每个 `RPCClient`，取出其 `get_skills()` 返回的 `SkillInfo` 列表，再将每个 `SkillInfo` 转换为 LangChain `StructuredTool`。
+3. **图构建**：调用 LangChain 的 `create_agent(model, tools, system_prompt)`，得到一个编译好的 `CompiledStateGraph`，随即启动后台线程 `_thread_loop`。
+
+```
+on_system_modules(modules)
+    │
+    ├─ ensure_ollama_model(...)      # 若 ollama: 前缀
+    ├─ _get_tools_from_modules(...)  # SkillInfo → StructuredTool
+    └─ create_agent(model, tools)    # 构建 LangGraph 状态机
+           └─ _thread.start()
+```
+
+### 1.2 LangGraph 状态图与决策节点
+
+`create_agent` 返回的是一个 LangGraph `CompiledStateGraph`。状态图本质上是一个有向图，节点之间通过消息列表（`{"messages": [...]}` 字典）传递状态。典型的 Agent 状态图包含两个节点：
+
+- **`agent` 节点**：调用 LLM（`BaseChatModel.invoke` / `stream`），返回 `AIMessage`。若 LLM 请求工具调用，消息中含有 `tool_calls` 字段。
+- **`tools` 节点**：接收 `tool_calls`，实际调用对应的 `StructuredTool.func`，返回 `ToolMessage`。
+
+节点之间的边是条件边：若 `AIMessage` 含 `tool_calls`，则路由到 `tools` 节点；若不含，则输出并结束本轮推理。整个过程会在一次用户消息处理期间迭代，直到 LLM 不再请求工具为止。
+
+```
+┌──────────┐    有 tool_calls    ┌──────────┐
+│  agent   │ ─────────────────▶ │  tools   │
+│ (LLM推理) │ ◀───────────────── │ (RPC执行) │
+└──────────┘    ToolMessage      └──────────┘
+     │
+     │ 无 tool_calls → 输出，结束
+```
+
+### 1.3 消息队列与历史
+
+`_thread_loop` 是一个守护线程，不断从 `_message_queue`（`Queue[BaseMessage]`）取消息（超时 0.5 秒）。每次取到消息后，在 `_lock`（`RLock`）保护下调用 `_process_message`：
+
+1. 发布 `agent_idle = False`，告知下游模块 Agent 正忙。
+2. 将消息追加进 `_history`，调用 `state_graph.stream({"messages": self._history}, stream_mode="updates")`，以流式方式逐节点接收更新。
+3. 每个节点输出的消息都追加入 `_history` 并发布到 `agent` Out 流。
+4. 当队列再次为空时，发布 `agent_idle = True`。
+
+值得注意：`_history` 是无上限的列表，随着对话积累会无限增长——这在长对话场景下是已知的内存权衡，需调用者自行截断或使用带内存管理的变种。
+
+### 1.4 具体调用链示例
+
+```
+用户发送 "navigate to the kitchen"
+    │
+    ▼
+human_input In流 → _on_human_input → _message_queue.put(HumanMessage)
+    │
+    ▼
+_thread_loop 取出消息 → _process_message
+    │
+    ▼
+state_graph.stream({"messages": history})
+    ├─ agent节点: gpt-4o 输出 tool_calls: [navigate_with_text("kitchen")]
+    ├─ tools节点: _skill_to_tool → wrapped_func → RpcCall → NavigationSkillContainer.navigate_with_text RPC
+    │   返回 "Navigating to kitchen..."
+    ├─ agent节点: gpt-4o 输出 "I'm heading to the kitchen now."
+    └─ 无 tool_calls → 结束本轮
+    │
+    ▼
+agent Out流 发布最终 AIMessage
+agent_idle → True
+```
+
+### 1.5 Ollama 前缀路由
+
+当 `config.model = "ollama:llama3.2"` 时：
+
+1. `on_system_modules` 中检测到 `"ollama:"` 前缀，调用 `ensure_ollama_model("llama3.2")`。
+2. `ollama_agent.py` 中的 `ensure_ollama_model` 列举本地模型，若不存在则调用 `ollama.pull(model_name)`。
+3. 模型字符串原样传入 `create_agent`，LangChain 的 `init_chat_model` 负责初始化 Ollama 后端。
+
+**注意**：`dimos/agents/ollama_agent.py` 仅包含两个独立工具函数（`ensure_ollama_model`、`ollama_installed`），**不包含任何 Agent 类**——误将其当作 Agent 变种会找不到任何类定义。
+
+---
+
+## 2. @skill schema 生成
+
+### 2.1 装饰器的本质
+
+`@skill`（`dimos/agents/annotation.py`）是一个极简装饰器：
+
+```python
+def skill(func: F) -> F:
+    func.__rpc__ = True
+    func.__skill__ = True
+    return func
+```
+
+它只在函数对象上设置两个属性标记，不做任何包装或 schema 生成。真正的 schema 生成发生在 `Module.get_skills()`（`dimos/core/module.py`）中：
+
+```python
+def get_skills(self) -> list[SkillInfo]:
+    skills: list[SkillInfo] = []
+    for name in dir(self):
+        attr = getattr(self, name)
+        if callable(attr) and hasattr(attr, "__skill__"):
+            schema = json.dumps(tool(attr).args_schema.model_json_schema())
+            skills.append(SkillInfo(
+                class_name=self.__class__.__name__,
+                func_name=name,
+                args_schema=schema
+            ))
+    return skills
+```
+
+关键路径：`tool(attr)`（LangChain 的 `@tool` 工厂）→ `.args_schema`（Pydantic 模型）→ `.model_json_schema()`（JSON Schema 字典）→ `json.dumps` → `SkillInfo.args_schema` 字段。
+
+### 2.2 schema 生成的 4 条铁律
+
+#### 规则一：必须有 docstring
+
+**要求**：被 `@skill` 装饰的方法必须有非空 docstring。
+
+**失败时机**：`get_skills()` 在 `Agent.on_system_modules` 中被调用，在此刻 LangChain 的 `tool()` 工厂尝试从 docstring 中提取工具描述。若 docstring 缺失，`tool()` 生成的 `StructuredTool` 的 `description` 字段为空字符串或抛出异常，导致 LLM 收到无描述的工具——LLM 几乎不会调用它，表现为 Agent 面对相关请求沉默或乱猜。**错误不会在 import 时或模块注册时报出，而是在运行时工具被忽略，排查极难。**
+
+```python
+# 错误示例——LLM 不会调用此工具
+@skill
+def move_forward(self, distance: float) -> str:
+    return f"moving {distance}m"
+
+# 正确示例
+@skill
+def move_forward(self, distance: float) -> str:
+    """Move the robot forward by the specified distance in meters.
+
+    Args:
+        distance (float): distance to move in meters
+    Returns:
+        str: outcome description
+    """
+    return f"moving {distance}m"
+```
+
+#### 规则二：所有参数必须有类型注解
+
+**要求**：每个参数（除 `self` 外）都必须有 Python 类型注解。
+
+**失败时机**：`tool(attr).args_schema` 由 LangChain 基于函数签名自动生成 Pydantic 模型。若参数无注解，Pydantic 无法推断字段类型，生成的 Pydantic 模型字段类型为 `Any`，进而导致 JSON Schema 中缺少 `type` 字段。**失败在 `get_skills()` 被首次调用时静默发生**（不抛异常），但 LLM 收到格式不完整的 schema，可能传入错误类型的参数，导致 RPC 调用时类型错误在运行时才暴露。
+
+```python
+# 错误示例——schema 生成不完整
+@skill
+def set_speed(self, speed, direction) -> str:
+    """Set robot speed and direction."""
+    ...
+
+# 正确示例
+@skill
+def set_speed(self, speed: float, direction: str) -> str:
+    """Set robot speed and direction."""
+    ...
+```
+
+#### 规则三：返回类型必须是 str
+
+**要求**：`@skill` 方法的返回类型注解必须是 `str`，实际也必须返回字符串。
+
+**失败时机**：`_skill_to_tool` 中的 `wrapped_func` 直接 `return str(result)` 将结果传回给 LangChain agent。若方法实际返回非字符串（如 `dict`、`None`、`Image`），框架会尝试转换——`None` 返回时特别处理为 `"It has started. You will be updated later."`，`Image`（有 `agent_encode` 方法）则触发图像追加到历史的特殊路径。**返回 `str` 以外的普通对象会被 `str()` 强转，LLM 收到原始 repr 字符串，逻辑通常但信息可能不可读。** 若方法抛出异常，`wrapped_func` 会捕获并返回 `f"Exception: Error: {e}"`，LLM 会看到该字符串并试图自行处理。注意：`mypy` 在 return type 不是 `str` 时会报错，**类型检查阶段就会发现**。
+
+#### 规则四：不得同时叠加 @rpc 与 @skill
+
+**要求**：同一方法上不能同时叠加 `@rpc` 和 `@skill`。
+
+**失败时机**：`@rpc` 将方法注册为 RPC 端点；`@skill` 将其标记为 LangChain 工具。两者共存时，`@rpc` 的包装层会干扰 LangChain `tool()` 对函数签名的自省——`tool()` 看到的是 `@rpc` 包装后的内部函数，其签名可能已被修改，导致 Pydantic 模型生成错误，或 `args_schema` 字段缺失。**失败在模块注册阶段（`start()` 时）就可能引发 `AttributeError` 或 `ValidationError`，阻止整个 blueprint 启动。**
+
+```python
+# 绝对错误——两者不能共存
+@rpc
+@skill
+def dangerous_method(self, x: int) -> str:
+    """Do something."""
+    return str(x)
+
+# 正确：普通 skill（不需要 @rpc）
+@skill
+def safe_skill(self, x: int) -> str:
+    """Do something."""
+    return str(x)
+```
+
+---
+
+## 3. 双 skills 对比与决策树
+
+DimOS 存在两个 skill 目录，它们的设计哲学和适用场景截然不同。
+
+### 3.1 `dimos/skills/`：平台无关的 Pydantic 技能库
+
+**技术基础**：基于 `AbstractSkill`（`dimos/skills/skills.py` 中的 `SkillLibrary` 体系）和 `pydantic.BaseModel`，用于构建与旧式 `agents_deprecated` 体系兼容的技能容器。工具描述通过 `pydantic_function_tool`（OpenAI SDK）转换。
+
+**特征**：
+- 每个 skill 是一个独立的 Pydantic 模型类，继承 `AbstractSkill`。
+- 在 `SkillLibrary` 的 `__init__` 中自动发现（通过 `dir(self.__class__)`）。
+- 使用 `openai.pydantic_function_tool` 生成 OpenAI function-calling schema。
+- **不依赖 `Module` 生命周期**（无 `start`/`stop`），可独立实例化。
+- 典型例子：`dimos/skills/speak.py` 的 `Speak`（直接调用 TTS，不需感知任何其他模块状态）。
+
+**适合场景**：依赖第三方 SDK（OpenAI、Google Maps 等）、与机器人硬件无关、需在不启动完整 Module 系统的情况下独立使用的技能。
+
+### 3.2 `dimos/agents/skills/`：Module-aware 的 @skill 容器
+
+**技术基础**：基于 `Module`（`dimos/core/module.py`）+ `@skill` 装饰器（`dimos/agents/annotation.py`），通过 LangChain `StructuredTool` 集成到 Agent 的工具链。
+
+**特征**：
+- 每个 skill 容器是一个完整的 `Module` 子类，有 `start`/`stop` 生命周期。
+- 通过 `@skill` 装饰的方法由 `get_skills()` 自动发现并注册为 LangChain 工具。
+- 可持有 `In`/`Out` 流（订阅图像、里程计等），可调用其他模块的 RPC。
+- 工具调用通过 RPC（LCM）在跨进程之间传递，天然隔离。
+- 典型例子：`dimos/agents/skills/navigation.py` 的 `NavigationSkillContainer`（需订阅里程计 `odom` 流、调用 `SpatialMemory`/`NavigationInterface` RPC）。
+
+**适合场景**：需要机器人运行时状态（传感器流、其他模块 RPC）、依赖 LangChain 工具上下文、平台相关的技能。
+
+### 3.3 决策树
+
+下面的 Mermaid flowchart 帮助你判断新 skill 应该放在哪里：
+
+```mermaid
+flowchart TD
+    A[我需要写一个新 skill] --> B{是否需要访问机器人运行时状态？\n例如：里程计、图像、其他模块 RPC}
+    B -- 否 --> C{是否依赖第三方 SDK？\n例如：OpenAI、Google Maps、ROS}
+    B -- 是 --> D[放在 dimos/agents/skills/\n继承 Module，使用 @skill]
+    C -- 是 --> E{SDK 是否已有 LangChain 集成？}
+    C -- 否 --> F{是否需要 LangChain StructuredTool 上下文？}
+    E -- 是 --> D
+    E -- 否 --> G[放在 dimos/skills/\n继承 AbstractSkill，使用 Pydantic]
+    F -- 是 --> D
+    F -- 否 --> G
+    D --> H[示例：NavigationSkillContainer\nSpeakSkill\ngoogle_maps_skill_container.py]
+    G --> I[示例：Speak AbstractSkill\ndemo_google_maps_skill.py]
+```
+
+### 3.4 实际放置示例
+
+| Skill | 目录 | 原因 |
+|---|---|---|
+| `NavigationSkillContainer` | `dimos/agents/skills/` | 需订阅 `odom`、调用 `SpatialMemory` RPC |
+| `SpeakSkill` | `dimos/agents/skills/` | 需初始化 TTS 节点，有 `start`/`stop` 生命周期 |
+| `GoogleMapsSkillContainer` | `dimos/agents/skills/` | 需 LangChain StructuredTool 上下文传递 |
+| `Speak`（AbstractSkill） | `dimos/skills/` | 独立于 Module 系统，直接调用 TTS 库 |
+| `GpsNavSkill` | `dimos/agents/skills/` | 需访问导航接口 RPC |
+
+---
+
+## 4. Spec Protocol 与编译期类型检查
+
+### 4.1 Spec 是什么
+
+`Spec`（`dimos/spec/utils.py`）是一个特殊标记基类：
+
+```python
+class Spec(Protocol):
+    pass
+```
+
+凡是继承了 `Spec` 的 Protocol 子类，都是"模块规格描述符"——用来在 Blueprint 的 `autoconnect` 阶段描述"我需要一个提供 X 能力的模块"，而不必指定具体是哪个类。Blueprint 引擎会在所有已注册的模块中自动寻找满足该 Spec 的实现。
+
+### 4.2 五个 Spec 文件一览
+
+**`dimos/spec/control.py`**：定义运动控制 Spec：
+
+```python
+class LocalPlanner(Protocol):
+    cmd_vel: Out[Twist]
+```
+
+任何发布 `cmd_vel`（`Twist` 类型 Out 流）的模块都满足此 Spec，例如 DWA 局部规划器或直接速度控制器。
+
+**`dimos/spec/perception.py`**：定义感知 Spec 层次：
+
+```python
+class Image(Protocol):
+    color_image: Out[ImageMsg]
+
+class Camera(Image):
+    camera_info: Out[CameraInfo]
+
+class DepthCamera(Camera):
+    depth_image: Out[ImageMsg]
+    depth_camera_info: Out[CameraInfo]
+
+class Odometry(Protocol):
+    odometry: Out[OdometryMsg]
+
+class Lidar(Protocol):
+    lidar: Out[PointCloud2]
+```
+
+通过继承实现能力的分层描述——`DepthCamera` 自动满足 `Camera`，`Camera` 自动满足 `Image`。
+
+**`dimos/spec/nav.py`**：定义完整导航 Spec：
+
+```python
+class Nav(Protocol):
+    goal_req: In[PoseStamped]
+    goal_active: Out[PoseStamped]
+    path_active: Out[Path]
+    cmd_vel: Out[Twist]
+```
+
+满足此 Spec 的模块必须同时提供目标接收（`goal_req`）、当前目标广播（`goal_active`）、路径广播（`path_active`）、速度输出（`cmd_vel`）——约束远比单个能力接口严格。
+
+**`dimos/spec/mapping.py`**：定义地图 Spec：
+
+```python
+class GlobalPointcloud(Protocol):
+    global_map: Out[PointCloud2]
+
+class GlobalCostmap(Protocol):
+    global_costmap: Out[OccupancyGrid]
+```
+
+**`dimos/spec/utils.py`**：提供 `is_spec`、`spec_structural_compliance`、`spec_annotation_compliance` 三个工具函数，被 `dimos/core/blueprints.py` 在 `autoconnect` 阶段调用。
+
+### 4.3 构建期验证流程
+
+Blueprint 的 `autoconnect` 在实际部署前进行 Spec 匹配验证，整个流程在**构建期（Python import 阶段）**完成，不等到运行时：
+
+```
+autoconnect(ModuleA, ModuleB, ...)
+    │
+    ├─ 解析每个 Module 的类型注解
+    │   ├─ In[T] / Out[T] → StreamRef
+    │   └─ Spec 子类注解 → ModuleRef
+    │
+    ├─ 对每个 ModuleRef，遍历所有候选 Module
+    │   ├─ spec_structural_compliance(candidate, spec)  # 结构检查（方法名/流名存在）
+    │   └─ spec_annotation_compliance(candidate, spec)  # 严格注解检查（类型完全匹配）
+    │
+    ├─ 若只有一个候选通过 → 自动连接
+    ├─ 若有多个候选通过 → 抛出歧义错误（见 remappings）
+    └─ 若没有候选通过 → 抛出 "no module meets spec" 错误
+```
+
+**结构检查**（`spec_structural_compliance`）使用 Python 内置的 `isinstance(obj, runtime_checkable(spec))`，只验证方法名/属性名是否存在，**忽略类型注解**。
+
+**注解检查**（`spec_annotation_compliance`）通过 `annotation_protocol` 第三方库构建严格的运行时 Protocol，同时验证名称和类型注解——只有完全匹配才通过。
+
+### 4.4 remappings 解决多候选歧义
+
+当多个模块都满足某个 Spec 时（例如两个相机模块都实现了 `spec.perception.Image`），Blueprint 引擎会抛出歧义错误。`remappings` 是解决此问题的标准机制：
+
+```python
+from dimos.spec.perception import Image
+from dimos.robot.unitree.go2.camera import DepthCamera, RGBCamera
+
+blueprint = autoconnect(
+    MyNavigationModule,
+    DepthCamera,
+    RGBCamera,
+).remappings([
+    # 显式指定 MyNavigationModule 的 color_image 来自 RGBCamera
+    (MyNavigationModule, "color_image", RGBCamera),
+])
+```
+
+`remappings` 的签名是 `list[tuple[type[Module], str, str | type[Module] | type[Spec]]]`——三元组中，第一个元素是请求方模块类，第二个是属性名，第三个是目标模块类或 Spec。`remapping_map` 在 `Blueprint` 中以不可变 `MappingProxyType` 存储，每次调用 `.remappings()` 返回一个新的 `Blueprint` 实例（不可变设计）。
+
+**失败模式**：若多个候选满足 Spec 且未设置 remapping，`blueprints.py` 的 `_check_ambiguity` 方法会在 `autoconnect` 阶段抛出 `ValueError`，明确列出冲突的模块名称。**此错误发生在 `dimos run` 启动 blueprint 时的构建阶段，属于编译期行为**，不会等到实际 RPC 通信才暴露。
+
+---
+
+## 5. MCP 三件套
+
+### 5.1 架构概览
+
+MCP（Model Context Protocol）支持由三个组件构成，它们的角色截然不同，不可混淆：
+
+```
+外部 MCP 客户端（Claude、Cursor 等）
+    │  HTTP POST /mcp（JSON-RPC 2.0）
+    ▼
+McpServer（Module）    ← in-process Module，暴露 HTTP 端点
+    │  RPC 调用（LCM）
+    ▼
+普通技能模块（NavigationSkillContainer 等）
+
+McpClient（Module）    ← in-process Module，连接远端 McpServer
+    │  HTTP POST → McpServer
+    ▼
+外部 McpServer
+
+McpAdapter             ← 纯 Python 辅助类（非 Module！）
+    │  HTTP POST → McpServer
+    ▼
+  CLI / 测试代码
+```
+
+### 5.2 McpServer：暴露 HTTP 端点
+
+**`dimos/agents/mcp/mcp_server.py`**
+
+`McpServer` 是一个完整的 `Module`，在 `start()` 时启动一个 `uvicorn` + `FastAPI` HTTP 服务器，默认监听 `GlobalConfig.mcp_port`（通常为 9990）。
+
+**暴露的 HTTP 端点**：
+
+| 端点 | 方法 | 描述 |
+|------|------|------|
+| `POST /mcp` | JSON-RPC 2.0 | 唯一入口，按 `method` 字段路由 |
+
+**支持的 JSON-RPC 方法**：
+
+| method | 描述 |
+|--------|------|
+| `initialize` | 握手，返回 protocol 版本（2025-11-25）和能力声明 |
+| `tools/list` | 返回所有已注册 skill 的 JSON Schema 描述 |
+| `tools/call` | 按名称调用指定 skill，通过 RPC 转发给实际模块 |
+
+`on_system_modules` 被调用时，`McpServer` 收集所有模块的 `SkillInfo` 列表，存入 FastAPI 应用全局状态（`app.state.skills`），并为每个 skill 预建 `RpcCall` 对象存入 `app.state.rpc_calls`。工具调用时，通过 `asyncio.get_event_loop().run_in_executor` 在线程池中同步执行 RPC 调用，避免阻塞 uvicorn 事件循环。
+
+`McpServer` 自身也通过 `@skill` 暴露了两个内省工具：`server_status`（返回 PID、模块列表、skill 列表）和 `list_modules`（返回按模块分组的 skill 清单）。
+
+### 5.3 McpClient：进程内模块连接远端 McpServer
+
+**`dimos/agents/mcp/mcp_client.py`**
+
+`McpClient` 是另一个完整的 `Module`，它**不暴露 HTTP 端点**，而是**作为消费方**通过 HTTP 调用远端 `McpServer`。它的结构与 `Agent` 几乎一致：持有 `_message_queue`、`_history`、`_state_graph`、`_thread`，内部同样运行 LangGraph 推理循环。
+
+**与 `Agent` 的关键区别**：
+
+| | `Agent` | `McpClient` |
+|--|---------|-------------|
+| 工具来源 | 进程内 RPC 调用（`_get_tools_from_modules`） | 通过 HTTP 从 McpServer 拉取（`_fetch_tools`） |
+| 工具调用 | 直接 RPC，同进程 | HTTP POST `/mcp` → `tools/call` |
+| HTTP 库 | 无 | `httpx.Client`（超时 120s） |
+| 工具发现时机 | `on_system_modules`（系统启动） | `on_system_modules` + 轮询直到 McpServer 就绪 |
+
+`_fetch_tools` 会轮询 `mcp_server_url`（默认 `http://localhost:9990/mcp`），调用 `initialize` 握手，再调用 `tools/list` 获取工具列表，将其转换为 LangChain `StructuredTool`。图像类工具的响应同样通过追加到历史的方式处理。
+
+### 5.4 McpAdapter：纯 Python 辅助类（非 Module）
+
+**`dimos/agents/mcp/mcp_adapter.py`**
+
+**关键事实：`McpAdapter` 不是 `Module`，不在 Blueprint 体系内，不通过 RPC 通信。**
+
+它是一个普通 Python 类，使用 `requests` 库直接发送 HTTP 请求到 McpServer，用于：
+
+- **CLI 命令**：`dimos mcp tools`、`dimos mcp call <tool>` 等命令通过 `McpAdapter.from_run_entry()` 发现运行中的 McpServer 并调用。
+- **集成测试 / e2e 测试**：在 `dimos/agents/mcp/test_mcp_*.py` 中，测试代码用 `McpAdapter` 验证工具注册和调用结果，无需启动完整的 Blueprint。
+- **任何需要与 McpServer 通信的非 Module 代码**。
+
+`McpAdapter.from_run_entry()` 类方法会从 `RunRegistry` 查找最近运行的进程条目，读取其 `mcp_url` 字段，实现零配置的进程发现。
+
+### 5.5 三者的互斥关系
+
+在同一个进程（Blueprint）中，**`McpServer` 和进程内 `Agent` 是互斥的**：
+
+- 含 `McpServer` 的 blueprint（如 `unitree-go2-agentic-mcp`）不包含 `Agent`——因为 `McpServer` 已经将所有 skill 通过 HTTP 暴露给外部 MCP 客户端，再在同进程中运行 `Agent` 是重复的。
+- `McpClient` 必须和 `McpServer` 在**不同进程**中（或至少不同 blueprint 中），因为 `McpClient` 的 `mcp_server_url` 指向外部 HTTP 地址。
+
+### 5.6 目前唯一支持 MCP 的 blueprint
+
+```
+unitree-go2-agentic-mcp
+```
+
+定义在 `dimos/robot/unitree/go2/blueprints/agentic/unitree_go2_agentic_mcp.py`：
+
+```python
+unitree_go2_agentic_mcp = autoconnect(
+    unitree_go2_spatial,      # 空间感知模块组（相机、SLAM 等）
+    McpServer.blueprint(),    # 暴露 HTTP /mcp 端点
+    mcp_client(),             # McpClient 连接 McpServer，运行 LangGraph
+    _common_agentic,          # 通用 agentic 模块（SpeakSkill 等）
+)
+```
+
+**只有包含 `McpServer` 的 blueprint 才能支持 `dimos mcp …` CLI 命令**。对其他 blueprint 使用 `dimos mcp` 会连接失败（McpServer 未启动，HTTP 端口不监听）。
+
+---
+
+## 6. Agent 变种清单
+
+### 6.1 `Agent`（`dimos/agents/agent.py`）——标准智能体
+
+**场景**：通用型 LLM 驱动智能体，适合大多数文本交互 + 工具调用场景。
+
+**核心流**：
+- `human_input: In[str]`——接收用户文本
+- `agent: Out[BaseMessage]`——发布每一步推理消息
+- `agent_idle: Out[bool]`——空闲状态广播
+
+**关键配置**（`AgentConfig`）：
+
+| 字段 | 默认值 | 说明 |
+|------|--------|------|
+| `model` | `"gpt-4o"` | LangChain model string，支持 `"ollama:<model>"` |
+| `system_prompt` | Go2 默认提示词 | 定义机器人角色 |
+| `model_fixture` | `None` | 测试用 mock 模型 JSON 路径 |
+
+**注意**：默认 `system_prompt` 是为 Unitree Go2 设计的。若用于 G1 机器人，必须显式传入 `system_prompt=G1_SYSTEM_PROMPT`，否则 LLM 会使用 Go2 的技能描述，导致幻觉行为（调用不存在的 Go2 特有技能）。
+
+### 6.2 `VLMAgent`（`dimos/agents/vlm_agent.py`）——视觉语言智能体
+
+**场景**：流式视觉问答，适合需要持续处理图像并回答自然语言问题的应用。
+
+**与 `Agent` 的核心区别**：
+
+| | `Agent` | `VLMAgent` |
+|--|---------|------------|
+| 输入流 | `human_input: In[str]` | `color_image: In[Image]` + `query_stream: In[HumanMessage]` |
+| 输出流 | `agent: Out[BaseMessage]` | `answer_stream: Out[AIMessage]` |
+| 工具支持 | 是（LangGraph 工具调用） | 否（直接 `_llm.invoke`） |
+| 历史管理 | 完整 LangGraph 状态机 | 手动列表（仅 `_invoke` 时追加） |
+| 推理范式 | ReAct 循环 | 单次问答 |
+
+**工作模式**：`VLMAgent` 订阅 `color_image` 流，每次新图像到来时暂存为 `_latest_image`。当 `query_stream` 收到 `HumanMessage` 时，将最新图像和查询文本组合（通过 `image.agent_encode()` 转为多模态内容）调用 LLM，将 `AIMessage` 发布到 `answer_stream`。
+
+`VLMAgent` 同样支持 `"ollama:"` 前缀路由，但使用 `init_chat_model`（LangChain 统一接口）而非 `create_agent`。
+
+### 6.3 `WebInput`（`dimos/agents/web_human_input.py`）——非 Agent 输入桥接模块
+
+**重要说明**：`WebInput` **不是一个 Agent**，它是一个 `Module`，作用是桥接 Web 浏览器的输入（文本 + 音频）到 LCM Transport。
+
+**功能**：
+- 启动一个 `RobotWebInterface` HTTP 服务器（端口 5555）。
+- 接收浏览器的直接文本输入，通过 `pLCMTransport("/human_input")` 发布。
+- 接收浏览器的音频流，经 `AudioNormalizer` → `WhisperNode`（STT）转录后，同样发布到 `/human_input` 传输层。
+- 不运行任何 LLM，不处理任何工具调用。
+
+**典型用法**：在 blueprint 中与 `Agent` 配合，`WebInput` 将 `/human_input` 流接入 `Agent.human_input`，实现网页前端对话。
+
+### 6.4 `ollama_agent.py`——仅工具函数，无 Agent 类
+
+**`dimos/agents/ollama_agent.py`** 文件只包含两个模块级函数：
+
+- `ensure_ollama_model(model_name: str) -> None`：检查并按需拉取 Ollama 模型。
+- `ollama_installed() -> str | None`：检查 Ollama 守护进程是否可用，返回错误提示字符串或 `None`。
+
+**此文件中没有任何 Agent 或 Module 子类。** `ensure_ollama_model` 被 `Agent` 和 `VLMAgent` 在检测到 `"ollama:"` 前缀时调用；`ollama_installed` 被 `requirements` 检查钩子使用，在 blueprint 启动前验证依赖。
+
+### 6.5 `dimos/agents_deprecated/`——遗留包，禁止在新代码中使用
+
+`dimos/agents_deprecated/` 是早期版本遗留的 Agent 框架，包含：
+
+- `agent.py`：基于 OpenAI SDK 直接调用的旧式 `Agent` 类（使用 `openai.OpenAI` 客户端而非 LangChain）。
+- `claude_agent.py`：基于 Anthropic SDK 的旧式 Agent。
+- `memory/`：基于 Chroma 向量库的语义记忆实现。
+- `modules/`：旧式模块系统（非 `dimos.core.Module`）。
+- `prompt_builder/`：手动构建 prompt 的工具类。
+- `tokenizer/`：手动分词计数器。
+
+**为何不能复用**：`agents_deprecated` 使用 `dimos.skills.skills.AbstractSkill`（Pydantic 体系）而非 `dimos.agents.annotation.skill`（Module 体系），与当前 `Module`/`Blueprint` 架构不兼容。它的 Agent 不通过 `on_system_modules` 接收模块，不支持 Spec Protocol 连线，不支持 MCP。**所有新代码请使用 `dimos.agents.agent.Agent` 或 `dimos.agents.vlm_agent.VLMAgent`。**
 
 ---
 
 ## 扩展阅读
 
 - 总览：[README](README.md)
+- 运行时模型深度：[runtime-model.md](runtime-model.md)
 - 能力：[`docs/capabilities/agents/`](../capabilities/agents/)
+- `AGENTS.md`：@skill 完整规则、Spec/RPC 接线规范、系统提示词参考
