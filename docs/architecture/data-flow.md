@@ -101,10 +101,10 @@ Agent 收到自然语言指令后，LLM 对可用 Skill 列表进行推理（zer
 
 | 症状 | 首先检查 | 源码位置 |
 |------|---------|---------|
-| `_latest_image` 始终为 `None` | GO2Connection 的 `video_stream()` 是否已 subscribe | `connection.py:232-233` |
-| Detection2DModule 无输出 | `sharpness_barrier` 丢帧阈值 / `max_freq=10` 限速 | `module2D.py:86-90` |
-| LCM detections stream 无消息 | `detector.detections.transport` 是否已配置 | `module2D.py:173` |
-| navigate_with_text 无声跌落 | SpatialMemory / ObjectTracking RPC 连接 | `navigation.py:152-170` |
+| `_latest_image` 始终为 `None` | GO2Connection 的 `video_stream()` 是否已 subscribe | `go2/connection.py` 中 `onimage` / `video_stream().subscribe(...)` |
+| Detection2DModule 无输出 | `sharpness_barrier` 丢帧阈值 / `max_freq=10` 限速 | `perception/detection/module2D.py` `sharpness_barrier` 串联 |
+| LCM detections stream 无消息 | `detector.detections.transport` 是否已配置 | `perception/detection/module2D.py` 中 `detector.detections.transport = LCMTransport(...)` |
+| navigate_with_text 无声跌落 | SpatialMemory / ObjectTracking RPC 连接 | `agents/skills/navigation.py` `_navigate_to_object` / `_navigate_using_semantic_map` |
 
 ---
 
@@ -223,11 +223,35 @@ GraspGen 返回最多 100 个候选（top-k 截断），`pick()` 最多尝试前
 
 | 症状 | 首先检查 | 源码位置 |
 |------|---------|---------|
-| `scan_objects()` 返回"No objects detected" | D3D 的 `objects` Out 是否已 connect 到 PAP 的 `objects` In | `pick_and_place_module.py:54-57` |
+| `scan_objects()` 返回"No objects detected" | D3D 的 `objects` Out 是否已 connect 到 PAP 的 `objects` In | `manipulation/pick_and_place_module.py` `objects: In[list[DetObject]]` |
 | `generate_grasps()` 超时或返回 `None` | GraspGen Docker 容器状态，`docker ps` 确认 | `graspgen_module.py:start()` |
-| `plan_to_pose()` 总返回 `False` | 感知障碍物位置，调用 `clear_perception_obstacles()` | `pick_and_place_module.py:127-135` |
+| `plan_to_pose()` 总返回 `False` | 感知障碍物位置，调用 `clear_perception_obstacles()` | `manipulation/pick_and_place_module.py` `clear_perception_obstacles` |
 | 夹爪闭合但物体掉落 | `graspgen_grasp_threshold` 过低（默认 -1.0 = 不过滤）；收紧阈值或增大 `topk_num_grasps` | `PickAndPlaceModuleConfig` |
 | `JointTrajectory` LCM 流中断 | ControlCoordinator 是否正常运行；`joint_state` In 是否有数据 | `manipulation_module.py:joint_state` |
+
+### 2.6 mapping trace —— PointCloud2 → VoxelGridMapper → global_map
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant L as lidar 源<br/>(GO2Connection / ReplayConnection)
+  participant VGM as VoxelGridMapper<br/>dimos/mapping/voxels.py:253
+  participant VMT as VoxelMapTransformer<br/>dimos/mapping/voxels.py:192
+  participant DS as 下游 Out[PointCloud2]<br/>(navigation / visualization)
+
+  L-->>VGM: PointCloud2 (lidar: In[PointCloud2])
+  Note over VGM: StreamModule[PointCloud2, PointCloud2]<br/>start() 内部建 NullStore 桥接
+  VGM->>VGM: stream.live() — 回填 + 实时尾
+  VGM->>VMT: pipeline(stream) = stream.transform(VoxelMap(**config))
+  VMT-->>VGM: Iterator[Observation[PointCloud2]]<br/>（体素融合后的稠密地图）
+  VGM-->>DS: global_map: Out[PointCloud2]<br/>（经 stream_to_port 推回 Module Out 端口）
+```
+
+`VoxelGridMapper`（`dimos/mapping/voxels.py:253`，`StreamModule[PointCloud2, PointCloud2]`）是 memory2 抽象栈在业务子系统的典型用法。`start()` 在 `StreamModule` 基类里自动做三件事：(1) 建 `NullStore` + `.stream(in_name, PointCloud2)` 拿到 pull-based stream；(2) 把 `lidar: In[PointCloud2]` port 的推式消息 `subscribe` 到 `stream.append`；(3) 把 `pipeline(stream.live())` 的输出经 `stream_to_port(..., global_map)` 推回 `Out[PointCloud2]` 端口。变换本体是 `VoxelMapTransformer(Transformer[PointCloud2, PointCloud2])`（`dimos/mapping/voxels.py:192`）——**它住在 `mapping/` 而非 `memory2/`**，遵循 memory2 "通用 ABC 在 memory2，领域变换就近放业务子系统" 的分工原则。详见 [subsystems § 6.4](/docs/architecture/subsystems.md#64-集成示例)。
+
+### 2.7 tool streams 事件流 —— @skill 后台进度 → MCP SSE
+
+长耗时 `@skill`（巡航、扫描、multi-step planning）通过 `ToolStream` 在 Module worker 里持续推送进度，最终落到 MCP SSE（Server-Sent Events）给外部 LLM 客户端。调用链：`@skill` 方法体内 `tool_stream.send({"message": ..., "progress": ...})` → `ToolStream`（`dimos/agents/mcp/tool_stream.py:103`）经 `pLCMTransport(TOOL_STREAM_TOPIC = "/tool_streams")` 跨 worker 转发 → `McpServer`（`dimos/agents/mcp/mcp_server.py`）订阅该 LCM 主题 → 通过 `notifications/message` + `notifications/progress` 两种 MCP SSE 事件推到 HTTP 客户端。MCP 客户端（Claude Desktop / `McpClient` Module / `dimos mcp call` CLI）看到的是标准 MCP 通知事件，对 `ToolStream` 的底层 LCM 转发完全无感。完整契约：[agent-stack § 5 Tool Streams](/docs/architecture/agent-stack.md#5-mcp-三件套)。
 
 ---
 
@@ -279,7 +303,7 @@ LegacyPickleStore（磁盘 pickle 文件）──► ReplayConnection.video_stre
                                      ──► ReplayConnection.odom_stream()   ─► PoseStamped（仿真）
 ```
 
-`make_connection()` 函数（`robot/unitree/go2/connection.py:86-98`）检测到 `connection_type == "replay"` 后，返回 `ReplayConnection` 实例而非 `UnitreeWebRTCConnection`。`ReplayConnection` 继承自 `UnitreeWebRTCConnection` 但覆盖了三个传感器方法，每个方法内部创建一个 `TimedSensorReplay`（即 `LegacyPickleStore`）实例，从磁盘 pickle 文件中读取历史数据并以 Observable 形式返回。
+`make_connection()` 函数（`robot/unitree/go2/connection.py` 中的 `make_connection`）检测到 `connection_type == "replay"` 后，返回 `ReplayConnection` 实例而非 `UnitreeWebRTCConnection`。`ReplayConnection` 继承自 `UnitreeWebRTCConnection` 但覆盖了三个传感器方法，每个方法内部创建一个 `TimedSensorReplay`（即 `LegacyPickleStore`）实例，从磁盘 pickle 文件中读取历史数据并以 Observable 形式返回。
 
 传感器替换对上层模块**完全透明**：`GO2Connection` 的 In/Out 端口、LCM transport 配置、pSHM channel 名均不变。`Detection2DModule` 仍然订阅 `color_image` Out；`NavigationInterface` 仍然收到 `odom` PoseStamped。这是 `Go2ConnectionProtocol` 接口抽象的核心价值——`lidar_stream()`、`odom_stream()`、`video_stream()` 三个方法真机和回放均实现此 Protocol。
 
@@ -383,14 +407,14 @@ if x.format == ImageFormat.BGR:
 
 | 维度 | 正常模式 | --replay 模式 | 变化的代码位置 |
 |------|---------|-------------|-------------|
-| **数据来源** | WebRTC → 真实机器人 | `LegacyPickleStore` → pickle 文件 | `go2/connection.py:make_connection()` |
-| **Connection 类** | `UnitreeWebRTCConnection` | `ReplayConnection` | `go2/connection.py:101` |
-| **时间戳来源** | 接收帧时 `time.time()`（当前时间） | 录制时的原始 `ts`，保留不变（历史时间） | `timeseries/base.py:317` |
-| **发出调度** | 实时推送（WebRTC 驱动） | `TimeoutScheduler.schedule_relative(delay)` | `timeseries/base.py:355` |
+| **数据来源** | WebRTC → 真实机器人 | `LegacyPickleStore` → pickle 文件 | `go2/connection.py` `make_connection()` |
+| **Connection 类** | `UnitreeWebRTCConnection` | `ReplayConnection` | `go2/connection.py` `ReplayConnection` |
+| **时间戳来源** | 接收帧时 `time.time()`（当前时间） | 录制时的原始 `ts`，保留不变（历史时间） | `timeseries/base.py` |
+| **发出调度** | 实时推送（WebRTC 驱动） | `TimeoutScheduler.schedule_relative(delay)` | `timeseries/base.py` |
 | **Transport 配置** | 不变 | 不变（pSHM / LCM channel 名相同） | — |
-| **机器人控制指令** | 真实执行（`move`、`standup`…） | 静默忽略（`ReplayConnection.move()` 直接返回 `True`） | `go2/connection.py:165` |
+| **机器人控制指令** | 真实执行（`move`、`standup`…） | 静默忽略（`ReplayConnection.move()` 直接返回 `True`） | `go2/connection.py` `ReplayConnection.move` |
 | **硬件状态** | 动态（真实 IMU、编码器反馈） | 静态（仅来自 odom pickle） | — |
-| **数据循环** | 无 | `loop=True`（默认），录制结束后自动循环 | `go2/connection.py:111` |
+| **数据循环** | 无 | `loop=True`（默认），录制结束后自动循环 | `go2/connection.py` `ReplayConnection.__init__` |
 | **ZED 相机** | `ZEDModule` 实例 | `FakeZEDModule` 实例 | `hardware/sensors/fake_zed_module.py` |
 | **确定性** | 非确定（网络抖动、OS 调度） | 接近确定（数据固定，OS 调度仍有微小差异） | — |
 | **Agent LLM** | 不变（正常调用） | 不变（正常调用，LLM 本身不确定） | — |

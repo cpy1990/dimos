@@ -114,7 +114,7 @@ flowchart TD
 ### 依赖
 
 - **上游**：`dimos/spec/perception.py` 中的 `Camera`、`DepthCamera`、`Pointcloud` Protocol；实际数据来自硬件驱动模块（Go2 相机、RealSense 等）。图像帧在进入检测层之前可经 `sharpness_barrier` 滤除模糊帧（来自 `msgs/sensor_msgs/Image.py`）。
-- **下游**：`navigation/` 订阅 `Detection2DArray` 驱动目标跟踪导航；`mapping/` 消费 `PointCloud2` 构建占用栅格；`memory/` 的 `EmbeddingMemory` 订阅 `color_image` 和 `global_costmap` 建立视觉空间记忆；`manipulation/PickAndPlaceModule` 通过 RPC 查询 `ObjectDB` 获取抓取目标位姿。
+- **下游**：`navigation/` 订阅 `Detection2DArray` 驱动目标跟踪导航；`mapping/` 消费 `PointCloud2` 构建占用栅格；`memory2/` 的 `SemanticSearch`（以及 `Recorder` 子类）订阅 `color_image` 做嵌入 / 录制；`manipulation/PickAndPlaceModule` 通过 RPC 查询 `ObjectDB` 获取抓取目标位姿。
 - **共享 Spec**：`dimos/spec/perception.py`（`Image`、`Camera`、`DepthCamera`、`Pointcloud`、`IMU`、`Odometry`、`Lidar`）。
 - **共享 Stream**：`color_image`（Image）；`depth_image`（Image）；`pointcloud`（PointCloud2）；`detections`（Detection2DArray）；`annotations`（ImageAnnotations）；`scene_update`（SceneUpdate）。
 
@@ -286,7 +286,7 @@ flowchart LR
 ### 依赖
 
 - **上游**：`spec/perception.py` 的 `Pointcloud` Protocol（点云来源）；`spec/perception.py` 的 `Odometry`（位姿融合）；`models/vl/`（OSM 地理查询的 VLM）。
-- **下游**：`navigation/` 通过 `spec/mapping.py` 的 `GlobalCostmap` 消费占用栅格；`memory/` 的 `EmbeddingMemory` 消费 `global_costmap`；`visualization/rerun/` 订阅 `global_map` 和 `global_costmap` 可视化。
+- **下游**：`navigation/` 通过 `spec/mapping.py` 的 `GlobalCostmap` 消费占用栅格；`memory2/` 的 `VoxelGridMapper` 消费 `lidar` 点云做体素融合（`VoxelMapTransformer` 住在 `mapping/`，走 memory2 `StreamModule` 部署）；`visualization/rerun/` 订阅 `global_map` 和 `global_costmap` 可视化。
 - **共享 Spec**：`dimos/spec/mapping.py`（`GlobalPointcloud`、`GlobalCostmap`）。
 - **共享 Stream**：`global_map`（PointCloud2）；`global_costmap`（OccupancyGrid）；`pointcloud`（In，PointCloud2）。
 
@@ -305,54 +305,79 @@ flowchart LR
 
 > 做什么见 [README § 6.6](/docs/architecture/README.md#-6-能力子系统全景)。本节聚焦内部架构、依赖、扩展点。
 
-### 内部架构
+memory/ 子系统由两块组成：**`memory2/`（主）** 是以 `Stream[T]` / `Transformer[T,R]` / `StreamModule` 为核心的通用存储抽象栈，承接图像、点云、嵌入、体素地图等所有持久化与流式处理需求；**`memory/timeseries/`（辅）** 是通用时序 KV 后端（5 实现），主要被 `--replay` 数据集加载与老代码路径使用。历史遗留的 `memory/embedding.py` 是未完成原型、**零非测试调用**，职责已被 `memory2.SemanticSearch` 吸收——详见 §6.5。（`Stream` / `Transformer` / `StreamModule`）
 
 ```mermaid
-flowchart TD
-  EM[EmbeddingMemory<br/>embedding.py]
-  TS[TimeSeriesStore ABC<br/>timeseries/base.py]
-  IM[InMemoryStore<br/>timeseries/inmemory.py]
-  PK[PickleDirStore<br/>timeseries/pickledir.py]
-  SQ[SQLiteStore<br/>timeseries/sqlite.py]
-  PG[PostgresStore<br/>timeseries/postgres.py]
-  LG[LegacyStore<br/>timeseries/legacy.py]
-  IMG[color_image<br/>In Image]
-  COST[global_costmap<br/>In OccupancyGrid]
-  CLIP[CLIPModel<br/>models/embedding/]
-  VEC[SpatialVectorDB<br/>ChromaDB]
-
-  IMG --> EM
-  COST --> EM
-  CLIP -->|embed| EM
-  EM -->|SpatialEmbedding| VEC
-  TS -->|实现| IM
-  TS -->|实现| PK
-  TS -->|实现| SQ
-  TS -->|实现| PG
-  TS -->|实现| LG
+flowchart LR
+  SRC[Backend / Stream 源] --> S[Stream&#91;T&#93;<br/>memory2/stream.py]
+  S -->|transform()| TX[Transformer chain]
+  TX --> SM[StreamModule&#91;TIn, TOut&#93;<br/>memory2/module.py]
+  SM -->|In/Out port| DS[下游 Module]
+  S -.->|live/save/drain| STORE[Backend]
 ```
 
-记忆子系统分两个正交部分：
+`Stream[T, O]`（`memory2/stream.py:58`，`CompositeResource, Generic[T, O]`）是**惰性拉式**迭代链：任何 `.after()` / `.before()` / `.time_range()` / `.at()` / `.near()` / `.tags()` / `.filter()` / `.search()` / `.search_text()` / `.order_by()` / `.limit()` / `.offset()` / `.map()` / `.map_data()` / `.scan_data()` / `.tap()` / `.transform()` 都返回新 `Stream`，直到 `for obs in s` 或 `.drain()` / `.drain_thread()` / `.to_list()` / `.first()` / `.last()` / `.count()` / `.materialize()` / `.observable()` / `.subscribe()` 才真正计算。`.live(buffer=None)` 切换到"回填 + 实时尾"模式（默认 `KeepLast()` 背压），必须在 `.transform()` 之前调用。`.save(target)` 是惰性 pass-through，把每个观测 append 到目标流的 backend。`.chain(unbound)` 把 `Stream()`（无 source 的管道模板）应用到已绑 backend 的流上，这是 `StreamModule` 静态 pipeline 的底层机制。
 
-**语义空间记忆**（`embedding.py`：`EmbeddingMemory` Module）：每隔一定距离触发，对当前帧图像用 CLIP（默认）或可插拔 `EmbeddingModel` 计算嵌入向量，连同当前 `PoseStamped` 封装为 `SpatialEmbedding`，存入 ChromaDB 向量数据库。查询时（`find_closest_image` RPC）在向量空间检索语义最相近的历史帧，并拼合当时的全局代价地图用于重导航。
+`Transformer[T, R]`（`memory2/transform.py:36`）是 `Iterator[Observation[T]] → Iterator[Observation[R]]` 的抽象基类。实现矩阵：`FnTransformer`（单 obs 映射，`transform.py:61`）、`FnIterTransformer`（生成器 wrap，`transform.py:75`）、`Batch`（批处理，`transform.py:85`）、`QualityWindow`（时间窗内挑质量峰值，`transform.py:416`）；还有**函数式便捷 helper**（均返回 `FnIterTransformer`）：`downsample(n)` / `throttle(interval)` / `measure_time(out)` / `measure_gpu_mem(out)` / `speed()` / `smooth(window)` / `smooth_time(seconds)` / `peaks(...)` / `significant(method)` / `normalize()`。
 
-**时间序列存储**（`timeseries/`）：`TimeSeriesStore[T]` 是泛型抽象基类，要求子类实现 `_save`、`_load`、`_delete`、`timestamps` 四个抽象方法。基类提供统一的 `save()`、`stream()`（RxPY Observable）、`seek_stream()`（从指定时间戳回放）等高级接口，即 replay 模式的基础设施。内置实现：`InMemoryStore`（快速原型）、`PickleDirStore`（轻量持久化，每帧一文件）、`SQLiteStore`（单文件持久化）、`PostgresStore`（生产级，支持并发读写）、`LegacyStore`（向后兼容旧格式）。`Timestamped` 类型约束（来自 `types/timestamped.py`）保证所有存储对象携带一致的时间戳字段。
+`StreamModule(Module, Generic[TIn, TOut])`（`memory2/module.py:69`）是把 memory2 pipeline 部署为 dimos Module 的基类：子类声明 `pipeline`（静态 `Stream()` 无绑模板 / `Transformer` 实例 / `def pipeline(self, stream)` 方法三选一）+ 恰好 1 个 `In[TIn]` + 1 个 `Out[TOut]`；`start()` 自动建一个 `NullStore` 桥接 push-based `In` → pull-based Stream → `Out`。
+
+### 6.2 成品 module / embed 三件套
+
+全部在 `memory2/module.py` 与 `memory2/embed.py`：
+
+- **`MemoryModule`**（`memory2/module.py:170`）：`Module` 基类，`config.db_path` 默认 `recording.db`（相对路径自动解析到 `DIMOS_PROJECT_ROOT`），延迟构造 `SqliteStore` 并注册为 disposable——所有需要 SQLite 后端的 memory 模块都继承它。
+- **`SemanticSearch`**（`memory2/module.py:196`，继承 `MemoryModule`）：`start()` 串一条 live pipeline——`color_image → .filter(brightness>0.1) → QualityWindow(sharpness) → EmbedImages(model, batch=2) → .save(embeddings)`；`@skill search(query: str) -> PoseStamped` 把文本向量喂给 `embeddings.search(vec).transform(peaks(...)).last().pose_stamped`。**这就是 `memory/embedding.py` 那份老原型的事实替代品**。
+- **`Recorder`**（`memory2/module.py:247`）：记录所有 `In` port 到 SQLite；子类声明要录哪些 topic（`color_image: In[Image]` / `lidar: In[PointCloud2]` 等），`_port_to_stream` 自动接 `tf` 加 world-frame pose；`--replay` 模式下自动禁用。
+- **`EmbedImages` / `EmbedText`**（`memory2/embed.py:40` / `:61`）：`Transformer[Any, Any]`，批量调用 `model.embed(...)` / `model.embed_text(...)`，把 `Observation` 派生为 `EmbeddedObservation`（多一个 `.embedding` 字段）。
+
+### 6.3 存储层七件套 + Backend + RegistryStore
+
+memory2 把存储拆成 7 个独立职责的子目录：
+
+| 子目录 | 职责 | 关键实现 |
+|---|---|---|
+| `memory2/store/` | `Store` ABC（`base.py`）+ 具体后端（`memory.py` / `null.py` / `sqlite.py`）；`stream(name, type)` 返回绑好 Backend 的 `Stream[T]` | `MemoryStore`（测试 / `materialize()` / `StreamModule` 桥）、`SqliteStore`（生产 / replay / dtop / demo）、`NullStore`（`StreamModule` 内部零开销桥） |
+| `memory2/observationstore/` | `ObservationStore[T]` ABC：只存元数据（id / ts / pose / tags / 向量指针），不碰 blob；`insert` / `query(StreamQuery)` / `fetch_by_ids` | `ListObservationStore`（内存）、`SqliteObservationStore`（带 FTS5 待办） |
+| `memory2/blobstore/` | 大 payload 二进制存储，key 是 `(stream_name, row_id)` | `FileBlobStore`（目录即 key space）、`SqliteBlobStore`（单文件） |
+| `memory2/codecs/` | `Codec(Protocol[T])`：`.encode(obj) -> bytes` / `.decode(bytes) -> obj`；blob 编解码分层 | `JpegCodec`（`codecs/jpeg.py:23`，turbojpeg 比 PIL 快 10–20×）、`LcmCodec`（`:23`，ROS 消息直通 LCM 串化）、`Lz4Codec`（`:25`）、`PickleCodec`（`:21`） |
+| `memory2/vectorstore/` | 向量索引；`.put` / `.search(name, vec, k) -> [(id, sim)]` | `MemoryVectorStore`（numpy 暴力搜）、`SqliteVectorStore`（`vectorstore/sqlite.py:70` 建表 `USING vec0(embedding float[{dim}] distance_metric=cosine)`，依赖 `sqlite-vec` 扩展） |
+| `memory2/notifier/` | "新观测到" 广播；`.subscribe(buffer)` / `.notify(obs)` 驱动 `Stream.live()` | `SubjectNotifier`（RxPY `Subject` 实现，`notifier/subject.py`） |
+| `memory2/vis/` | 观测流可视化；`plot/` 出图（elements / plot / rerun / svg），`space/` 出空间渲染（同 4 份） | `plot.py` / `rerun.py` / `svg.py` 分前端 |
+
+`Backend[T]`（`memory2/backend.py:43`，`CompositeResource, Generic[T]`）把上面 4 件套组合成一个流：`metadata_store + codec + blob_store? + vector_store? + notifier`。`.append(obs)` 流水线是 encode → insert → put blob → put vector → commit → notify；`.iterate(query)` 根据 `StreamQuery` 走 snapshot / vector_search / live tail 三种路径。`RegistryStore`（`memory2/registry.py:46`）把每个流的 backend 组合序列化到 SQLite `_streams` 表，用于**跨 run 保留配置**——`SqliteStore.stream(name, type)` 首次建流时写注册表，后续 run 同名流自动复原 codec / blob_store / vector_store 配置。
+
+### 6.4 集成示例
+
+memory2 抽象在仓库内已有 4 类典型用法：
+
+- **`VoxelGridMapper`**（`dimos/mapping/voxels.py:253`，继承 `StreamModule[PointCloud2, PointCloud2]`）：`pipeline(stream) = stream.transform(VoxelMap(**config))`，承接 `lidar: In[PointCloud2]` 并输出融合后的 `global_map: Out[PointCloud2]`。**配套的 `VoxelMapTransformer`（`dimos/mapping/voxels.py:192`）住在 `mapping/`，不在 `memory2/`**——领域特定变换按"就近放置"原则落在业务子系统里，这是 memory2 提倡的分工。
+- **`Recorder`**（go2 blueprint 的录制管线）：在 `unitree_go2_agentic` / `unitree_go2_recording` 等 blueprint 里子类化，声明 `color_image` / `lidar` / `odom` 等 `In` port，数据自动落到 SQLite 供 `--replay` 加载。
+- **`SqliteStore`**：`--replay` 数据集加载、`dimos dtop` 流监控、以及 `memory2/` 自带的 `demo_*` 脚本都以它为主存储；开箱支持 codec 压缩 + `vec0` 向量索引 + live `.subscribe` 广播三合一。
+- **`RegistryStore`**：`SqliteStore` 内部用它把每个流的 backend 组合（codec / blob_store / vector_store 的类名 + config）序列化保存——**同一个 SQLite 文件在不同 run 打开时配置自动复原**，新代码无需重新声明。
+
+### 6.5 `memory/`（legacy 短注）
+
+`memory/timeseries/` 是历史留下的通用时序 KV 层，基类 `TimeSeriesStore[T]`（`memory/timeseries/base.py:35`）定义 `_save` / `_load` / `_delete` / `timestamps` 四抽象方法 + `save()` / `stream()` / `seek_stream()` 高级接口。5 后端并存：`InMemoryStore`（`inmemory.py:23`）、`SqliteStore`（`sqlite.py:40`）、`PickleDirStore`（`pickledir.py:27`）、`PostgresStore`（`postgres.py:41`）、`LegacyPickleStore`（`legacy.py:33`，即 go2 `TimedSensorReplay` 用的老 pickle 格式）。新代码优先用 `memory2.SqliteStore`，这里仅做 `--replay` 数据集与老路径的兼容层。
+
+`memory/embedding.py` 的 `EmbeddingMemory`（`:49`）是未完成原型——目前仅 `test_embedding.py` 引用，生产代码零调用；职责已被 `memory2.SemanticSearch`（§6.2）完整吸收，不再推荐使用，后续版本会删除。注意 `dimos/perception/spatial_perception.py` 的 `SpatialMemory`（`:71`）是**感知侧**的空间记忆 Module，与本 `memory/` 子系统无继承关系——见 data-flow.md § 1 perception trace。
 
 ### 依赖
 
-- **上游**：`perception/` 的 `color_image` Stream；`mapping/` 的 `global_costmap` Stream；`models/embedding/`（CLIP 等嵌入模型）。
-- **下游**：`navigation/` 通过 `EmbeddingMemory.find_closest_image` RPC 获取历史场景用于重定位；`agents/` 通过 Skill 调用 `EmbeddingMemory` 进行场景问答。
-- **共享 Spec**：无直接公共 Spec；`EmbeddingMemory` 通过 `spec/perception.py` `Image` 输入、`spec/mapping.py` `GlobalCostmap` 输入（结构鸭子类型）。
-- **共享 Stream**：`color_image`（In）；`global_costmap`（In）。
+- **上游**：`perception/` 的 `color_image` / `lidar` / `odom` 等 In port；`models/embedding/`（`CLIPModel` 等）喂给 `EmbedImages` / `EmbedText`；`mapping/` 提供 `VoxelMapTransformer` 这类领域变换。
+- **下游**：`--replay` 通过 `memory/timeseries/` 读取历史帧；`dimos dtop` 通过 `memory2` live subscribe 做流监控；Agent 通过 `SemanticSearch.search` skill 触发视觉问答。
+- **共享 Stream**：所有 `StreamModule` 子类与 `Recorder` 子类的 `In` / `Out` 都是 dimos 标准 typed stream（见 §2）。
 
 ### 扩展点
 
 | 想加什么 | 改哪里 | 模式 |
 |---|---|---|
-| 新嵌入模型（MobileCLIP、SigLIP） | 在 `models/embedding/` 新增 `EmbeddingModel` 实现；`EmbeddingMemory` 配置中替换 | 模型替换 |
-| 新时序后端（Redis、InfluxDB） | 继承 `TimeSeriesStore`，实现四个抽象方法 | ABC 实现 |
-| 新记忆查询策略（时间加权、姿态过滤） | 扩展 `EmbeddingMemory` 的 `find_closest_image` 逻辑 | 方法扩展 |
-| 持久化 replay 数据集 | 使用 `PickleDirStore`/`SQLiteStore` 作为记录后端；`dimos --replay` 自动加载 | 配置驱动 |
+| 新 `Transformer` 变换 | 继承 `memory2/transform.py:Transformer[T, R]`，实现 `__call__(upstream)`；业务特定的放对应子系统（如 `VoxelMapTransformer` 在 `mapping/`） | ABC 实现 |
+| 新 codec（zstd / avro / ProtoBuf） | 新增 `memory2/codecs/<name>.py`，实现 `Codec(Protocol[T])`；`codec_for(type)` 通过注册表查 | Protocol 实现 |
+| 新 vector store（Milvus / Qdrant） | 继承 `memory2/vectorstore/base.py:VectorStore`，实现 `put` / `search` / `serialize` | ABC 实现 |
+| 新 embedding skill | 子类化 `MemoryModule`，组合 `EmbedText` + `.search()`；参考 `SemanticSearch` | 模板复用 |
+| 录制新 topic | 子类化 `Recorder`，加 `<name>: In[<MsgType>]` 字段 | 声明即注册 |
+| 跨 run 保留新配置 | 用 `RegistryStore` 已有机制；或在 `Backend.serialize()` 增扩新字段 | 配置驱动 |
 
 ---
 
