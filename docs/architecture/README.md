@@ -153,13 +153,13 @@ classDiagram
     +returns str
     +auto JSON schema
   }
-  class Agent {
+  class AgentSpecImpl {
     +Spec Protocol refs
     +LLM tool calls
   }
   Blueprint o-- Module : 包含并编排
   Module <|-- SkillContainer : Skill 容器是\nModule 子类
-  Agent ..> SkillContainer : 通过 Spec Protocol\n引用 @skill 方法
+  AgentSpecImpl ..> SkillContainer : 通过 Spec Protocol\n引用 @skill 方法
 ```
 
 #### 最小可运行 Blueprint 片段
@@ -413,16 +413,18 @@ def agent_send(self, message: str) -> str:
 
 ### § 4. Agent 系统
 
-DimOS 的 agent 层不是单一类，而是一组协作的 Module：自动决策的 `Agent`、视频流推理的 `VLMAgent`、人工介入的 `WebInput`。它们都继承 `Module`，通过类型化 stream 与底层子系统通信，通过 `@skill` 装饰器把动作暴露给 LLM 工具调用图。理解 agent 层的前提是认清它在命名、包边界、文件布局上存在多处重叠陷阱——这正是新工程师最容易踩坑的地方。
+DimOS 的 agent 层不是单一类，而是一组**契约 + 模板 + 实现者**的组合：`AgentSpec(Spec, Protocol)` 定义编译期契约，`demo_agent` / `demo_agent_camera` 提供纯 MCP 的模板蓝图（不绑硬件），`McpClient` / `VLMAgent` 等 Module 是具体实现者；`WebInput` 则是与 agent 配合的人工介入输入桥接模块。它们都通过类型化 stream 与底层子系统通信，通过 `@skill` 装饰器把动作暴露给 LLM 工具调用图。理解 agent 层的前提是认清它在命名、包边界、文件布局上存在多处重叠陷阱——这正是新工程师最容易踩坑的地方。
 
 #### Agent 体系实际形态
 
 | 类型 | 文件 | 说明 |
 |---|---|---|
-| `Agent` | `dimos/agents/agent.py` | 主智能体类；`Module` 子类；使用 LangGraph + LangChain `create_agent`；默认 `model="gpt-4o"`；`model.startswith("ollama:")` 分支路由到本地 Ollama |
-| `VLMAgent` | `dimos/agents/vlm_agent.py` | 独立的视觉语言模型推理 Module，专门处理视频流输入 |
+| `AgentSpec(Spec, Protocol)` | `dimos/agents/agent_spec.py:22` | 编译期契约；核心 RPC 为 `add_message` / `dispatch_continuation`；任何实现该 Protocol 的 Module 都可作为 agent 角色参与 blueprint |
+| `demo_agent` / `demo_agent_camera` | `dimos/agents/demo_agent.py` | **模块级 blueprint 变量**（非 class）；`autoconnect(McpServer.blueprint(), McpClient.blueprint(), …)`——不绑硬件的 MCP 模板蓝图，新机器人 agentic blueprint 的起点 |
+| `VLMAgentSpec(Spec, Protocol)` | `dimos/agents/vlm_agent_spec.py:21` | 视觉问答专用契约（围绕图像流 + 单次问答） |
+| `VLMAgent` | `dimos/agents/vlm_agent.py` | 目前唯一的 `VLMAgentSpec` 实现者；流式视觉推理 Module |
 | `WebInput` | `dimos/agents/web_human_input.py` | 人工介入 Module（文件名含 `web_human_input`，类名为 `WebInput`）；通过 Web 界面接收人类指令注入对话流 |
-| 工具函数 | `dimos/agents/ollama_agent.py` | **不是类**；只暴露两个函数：`ensure_ollama_model` 和 `ollama_installed`；供 `Agent.__init__` 内部调用 |
+| 工具函数 | `dimos/agents/ollama_agent.py` | **不是类**；只暴露两个函数：`ensure_ollama_model` 和 `ollama_installed`；供 agent 实现者在检测到 `"ollama:"` 前缀时调用 |
 
 ```mermaid
 classDiagram
@@ -430,27 +432,31 @@ classDiagram
     +start() None
     +stop() None
   }
-  class Agent {
-    +config.model: str
-    +config.system_prompt: str
+  class AgentSpec {
+    <<Protocol>>
+    +add_message(msg) None
+    +dispatch_continuation() None
+  }
+  class demo_agent {
+    <<blueprint>>
   }
   class VLMAgent {
     +config.system_prompt: str
   }
   class WebInput {
   }
-  Module <|-- Agent
-  Module <|-- VLMAgent
+  AgentSpec <|.. demo_agent
+  AgentSpec <|.. VLMAgent
   Module <|-- WebInput
 ```
 
-> **Ollama 不是独立子类**：没有 `OllamaAgent` 类。是 `Agent` 读取 `model="ollama:llama3"` 这类前缀，在 `__init__` 里调用 `ensure_ollama_model()` 拉取模型，然后路由到本地 Ollama 推理。`dimos/agents/ollama_agent.py` 只是工具函数文件，新工程师若误以为此文件定义了独立子类，将浪费大量调试时间。
+> **Ollama 不是独立子类**：没有 `OllamaAgent` 类。`dimos/agents/ollama_agent.py` 只是工具函数文件，agent 实现者读取 `model="ollama:llama3"` 这类前缀时调用 `ensure_ollama_model()` 拉取模型，然后路由到本地 Ollama 推理。新工程师若误以为此文件定义了独立子类，将浪费大量调试时间。
 
 #### 关键避坑（命名重叠 3）：legacy 包 `dimos/agents_deprecated/`
 
 `dimos/agents_deprecated/` 是历史遗留包，包含旧式 OpenAI/Claude agent 实现（`agent.py` 定义了 `LLMAgent` 和 `OpenAIAgent`，还有 `claude_agent.py`、`memory/`、`modules/`、`prompt_builder/`、`tokenizer/` 等子包）。目前仓库内 `dimos/web/dimos_interface/api/README.md` 还留有 `from dimos.agents_deprecated.agent import OpenAIAgent` 的过渡性引用。
 
-**新代码中严禁使用 `dimos/agents_deprecated/`**。典型陷阱：`grep -rn "class Agent"` 会同时命中 `dimos/agents/agent.py`（当前）和 `dimos/agents_deprecated/agent.py`（历史），误导入后者引入已废弃 API，在调用 `start()` 或加入 blueprint 时才报错。判断方法：检查路径是否含 `_deprecated`，或类是否继承 `Module`（当前体系）。
+**新代码中严禁使用 `dimos/agents_deprecated/`**。典型陷阱：对 `class\s+Agent` 做仓库级 grep 会命中 `dimos/agents_deprecated/agent.py`（历史，仍定义 `LLMAgent` / `OpenAIAgent`），而当前体系已不存在 `dimos/agents/agent` 单体 Module——改由 `AgentSpec` Protocol + `demo_agent` 模板承担（见上表）。误导入已废弃 API 后，在调用 `start()` 或加入 blueprint 时才报错。判断方法：检查路径是否含 `_deprecated`，或类是否继承 `Module`（当前体系）。新代码请实现 `dimos.agents.agent_spec.AgentSpec` Protocol，或以 `demo_agent` / `demo_agent_camera` blueprint 为模板。
 
 #### 关键避坑（命名重叠 4）：两套 skills 体系
 
@@ -487,7 +493,7 @@ classDiagram
 
 `@skill` 装饰器定义在 `dimos/agents/annotation.py`。它同时设置 `__rpc__ = True` 和 `__skill__ = True`，把方法暴露给 LLM 工具调用图。（§1 已在最小蓝图片段中介绍 `@skill` 的基本用法；本节列出所有硬性规则。）以下 4 条规则缺一不可：
 
-1. **docstring 必须存在**：缺少 docstring 会让 LangChain 在第一次 `get_skills()` 时抛 `ValueError`——错误**首次执行技能查询时才暴露**，而非启动时；调试时易被误判为运行时随机失败。
+1. **docstring 必须存在**：缺少 docstring 会让内置的 `@tool` 适配器在第一次 `get_skills()` 时抛 `ValueError`——错误**首次执行技能查询时才暴露**，而非启动时；调试时易被误判为运行时随机失败。
 
 2. **所有参数必须有类型注解**：缺少注解导致生成的 JSON Schema 中该参数没有 `"type"` 字段，LLM 没有类型信息，调用时可能传入类型错误的值而没有显式报错。支持的参数类型：`str`、`int`、`float`、`bool`、`list[str]`、`list[float]`。
 
@@ -535,13 +541,18 @@ class MySkillContainer(Module):
 
 #### MCP 三件套
 
-MCP（Model Context Protocol）提供标准化的工具调用协议，**两种使用模式都支持**：（a）外部客户端（如 Claude Desktop）通过 HTTP 直接调用 `McpServer` 暴露的技能；（b）进程内 `McpClient` 作为 Module 在同一 blueprint 进程中执行 LLM 推理并调用同进程的 `McpServer`。**DimOS 当前发布的 MCP blueprint（`unitree-go2-agentic-mcp`）采用 (b) 进程内模式**——`McpClient` 与 `McpServer` 共存于一个 blueprint 进程；外部客户端模式是协议层支持但目前未直接 ship 的形态。DimOS 中 MCP 由两个 Module 加一个辅助类协作实现，全部定义在 `dimos/agents/mcp/`：
+MCP（Model Context Protocol）提供标准化的工具调用协议。DimOS 中 MCP 由两个 Module 加一个辅助类协作实现，全部定义在 `dimos/agents/mcp/`：
 
 - **`McpServer`**（`mcp_server.py`）：FastAPI HTTP 服务，监听 9990 端口，把 blueprint 中所有 `@skill` 方法注册为 MCP 工具端点。
-- **`McpClient`**（`mcp_client.py`）：进程内 LLM 客户端，连接 McpServer，通过工具调用协议与技能交互。
-- **`McpAdapter`**（`mcp_adapter.py`）：**普通 Python 类（非 Module）**，提供面向 Python 调用方的类型化接口，封装对运行中 MCP server 的 HTTP 调用；主要供测试 / 外部集成使用，非运行时必选组件。
+- **`McpClient`**（`mcp_client.py`）：进程内 LLM 客户端 Module，连接远端（或同进程）McpServer，目前是 `AgentSpec` Protocol 最常用的实现者。
+- **`McpAdapter`**（`mcp_adapter.py`）：**普通 Python 类（非 Module）**，封装对运行中 MCP server 的 HTTP 调用；供 CLI（`dimos mcp …`）与测试 / 外部集成使用。
 
-**关键约束**：MCP 模式与进程内 `Agent` 模式互斥。在同一 blueprint 中，要么包含 `Agent`（本地 LLM 决策），要么包含 `McpServer` + `McpClient`（外部 MCP 客户端决策），不能同时存在两者。当前仓库中唯一正式发布的 MCP-enabled blueprint 是 `unitree-go2-agentic-mcp`（`dimos/robot/unitree/go2/blueprints/agentic/unitree_go2_agentic_mcp.py`）。新工程师若想在其他 blueprint 中使用 `dimos mcp` 命令，会发现 MCP 服务未启动——因为只有包含 `McpServer` 的 blueprint 才会开放该端点。
+**支持 MCP 的 blueprint 分两类**（只有含 `McpServer` 的 blueprint 能被 `dimos mcp …` CLI 发现）：
+
+- **硬件绑定的 agentic blueprint**（5 个）：`unitree_go2_agentic`、`unitree_go2_agentic_huggingface`、`unitree_go2_agentic_ollama`、`unitree_go2_security`、`unitree_go2_temporal_memory`（均位于 `dimos/robot/unitree/go2/blueprints/agentic/`）。
+- **纯 MCP 模板 blueprint**（2 个）：`demo_agent` / `demo_agent_camera`（`dimos/agents/demo_agent.py`）——不绑硬件，是新机器人 agentic blueprint 的起点模板。
+
+Tool Streams（PR #1713，`ToolStream` @ `dimos/agents/mcp/tool_stream.py`）允许长耗时 `@skill` 在后台持续向 MCP 客户端推送进度通知，走 `TOOL_STREAM_TOPIC = "/tool_streams"` LCM 主题跨 worker 转发。详见 [agent-stack.md §5](/docs/architecture/agent-stack.md#5-mcp-三件套)。
 
 #### 系统提示词：Go2 vs G1
 
@@ -1287,7 +1298,8 @@ Agent 调用 `skills.speak` skill，将"到了"文本转换为语音并播放给
 |---|---|---|---|
 | 检测 | `perception.detection.module2D` | `Detection` | LCM |
 | 记忆 | `memory.embedding` | RPC 读写 | SHM |
-| 决策 | `agents.agent_spec` + `agents.demo_agent` | LLM 内部循环 | n/a |
+| 决策 | `agents.agent_spec` | AgentSpec Protocol 契约 | n/a |
+| 决策 | `agents.demo_agent` | 纯 MCP 模板蓝图 | MCP (HTTP/SSE) |
 | 导航 | `navigation.replanning_a_star` | `Path`、`Velocity` | DDS |
 | 控制 | `control.tick_loop` | `JointCmd` | DDS / SHM |
 | TTS | `skills.speak` | RPC | LCM |
