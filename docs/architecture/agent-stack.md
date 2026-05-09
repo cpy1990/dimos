@@ -241,6 +241,23 @@ flowchart TD
 | `Speak`（AbstractSkill） | `dimos/skills/` | 独立于 Module 系统，直接调用 TTS 库 |
 | `GpsNavSkill` | `dimos/agents/skills/` | 需访问导航接口 RPC |
 
+#### `skills/manipulation/` — 约束化机械臂动作（新增）
+
+`dimos/skills/manipulation/` 下共 **6 个** `@skill`，为 OpenArm 双臂提供 LLM 可调用入口（OpenArm 机械臂随行，见 [robot-platforms §4.3](/docs/architecture/robot-platforms.md#43-openarm-双臂)）：
+
+- `abstract_manipulation_skill.py` — 基类（约束绑定 / 参数验证）
+- `force_constraint_skill.py` — 力约束（夹爪 / 拾取阻力）
+- `translation_constraint_skill.py` — 平移约束（限制直线运动范围）
+- `rotation_constraint_skill.py` — 旋转约束（限制姿态偏转）
+- `manipulate_skill.py` — 通用操作（参数化目标 pose）
+- `pick_and_place.py` — 拾取与放置（组合技能）
+
+**分层：** `dimos/types/manipulation.py`（见 [subsystems §12](/docs/architecture/subsystems.md#12-types)）定义约束领域类型（`AbstractConstraint` / `ForceConstraint` / `ManipulationTask` 等 9 类），本处是执行层；Agent 把用户自然语言映射到约束参数后实例化 skill。
+
+**其他平台 / 协议特定位置的 skill：**
+- `skills/unitree/unitree_speak.py` — Unitree 平台专用 TTS skill（Go2 随行）
+- `skills/rest/rest.py` — 通用 REST 客户端 skill（HTTP 请求工具）
+
 ---
 
 ## 4. Spec Protocol 与编译期类型检查

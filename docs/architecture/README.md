@@ -707,9 +707,10 @@ flowchart TB
 | `unity/` | Unity 后端（VLA Challenge 基线，TCP 桥接，`UnityBridgeModule`） |
 | `engines/` | 统一引擎接口（`mujoco_engine.py`、`base.py`、`registry.py`） |
 | `base/` | Simulator/Stream 基类（`simulator_base.py`、`stream_base.py`） |
-| `manipulators/` | 仿真内机械臂接口（`sim_module.py`、`sim_manip_interface.py`） |
 | `utils/` | 工具（`xml_parser.py` — 解析 MuJoCo MJCF 文件） |
 | `sim_blueprints.py` | 仿真专用蓝图注册入口 |
+
+> 仿真内机械臂接口**已迁至** `dimos/hardware/manipulators/sim/`，见 [robot-platforms §4](/docs/architecture/robot-platforms.md#4-机械臂)。
 
 #### 仿真 vs 真机切换
 
@@ -796,7 +797,7 @@ flowchart LR
 dimos/control/
 ├── tick_loop.py          # 核心：read→compute→arbitrate→route→write 单次 tick
 ├── coordinator.py        # ControlCoordinator：Module 封装，管理所有 ConnectedHardware
-├── components.py         # 数据类：HardwareComponent、HardwareId、JointState
+├── components.py         # 数据类：HardwareComponent、HardwareId、JointState（G1 wholebody 随 PR #1954 扩展）
 ├── hardware_interface.py # ConnectedHardware / ConnectedTwistBase 适配器包装
 ├── tasks/
 │   ├── cartesian_ik_task.py   # 笛卡尔空间 IK 任务
@@ -804,7 +805,11 @@ dimos/control/
 │   ├── servo_task.py          # 伺服任务（实时跟随目标位姿）
 │   ├── teleop_task.py         # 遥操作任务
 │   └── velocity_task.py       # 速度控制任务
-└── blueprints.py         # 预配置 Blueprint：coordinator-mock / coordinator-xarm7 / coordinator-dual-mock
+└── blueprints/
+    ├── basic.py          # coordinator-mock / coordinator-xarm7
+    ├── dual.py           # coordinator-dual-mock / 双臂组合
+    ├── mobile.py         # 底盘 + 机械臂组合
+    └── teleop.py         # 遥操作专用预设
 ```
 
 **主要 stream**
