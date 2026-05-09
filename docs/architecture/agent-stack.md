@@ -254,7 +254,7 @@ flowchart TD
 
 **分层：** `dimos/types/manipulation.py`（见 [subsystems §12](/docs/architecture/subsystems.md#12-types)）定义约束领域类型（`AbstractConstraint` / `ForceConstraint` / `ManipulationTask` 等 9 类），本处是执行层；Agent 把用户自然语言映射到约束参数后实例化 skill。
 
-**其他平台 / 协议特定位置的 skill：**
+**其他平台 / 协议特定位置的 skill：**（以下每个目录目前仅含 1 个 skill，列出仅供索引——平台 / 协议特定场景的点状补丁，不构成独立子包。）
 - `skills/unitree/unitree_speak.py` — Unitree 平台专用 TTS skill（Go2 随行）
 - `skills/rest/rest.py` — 通用 REST 客户端 skill（HTTP 请求工具）
 

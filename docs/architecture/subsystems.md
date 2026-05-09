@@ -53,7 +53,7 @@ flowchart LR
 
 `components.py` 集中管理 `HardwareComponent` 配置（类型别名 `HardwareId`、`JointName` 等），以及底盘方向映射 `TWIST_SUFFIX_MAP`；随 PR #1954 的 G1 全身控制接入，新增电机组 / 关节簇定义。`coordinator.py` 是 `ControlCoordinator` Module 主体，注册 tick 循环、调度所有 `ControlTask`。`hardware_interface.py` 提供 `ConnectedHardware` / `ConnectedTwistBase` 适配器包装，把配置项拼装为运行时可驱动的实例。
 
-`blueprints/` 子包（`dimos/control/blueprints/`）提供若干预配置的开箱即用蓝图：`basic.py`（单臂 mock / xArm 真机）、`dual.py`（双臂 mock / Piper+xArm 真机）、`mobile.py`（底盘+机械臂组合）、`teleop.py`（遥操作预设）。
+`blueprints/` 子包（`dimos/control/blueprints/`）提供若干预配置的开箱即用蓝图：`basic.py`（单臂 mock / xArm 真机）、`dual.py`（双臂 mock / Piper+xArm 真机）、`mobile.py`（底盘+机械臂组合）、`teleop.py`（遥操作预设）。**重构注**：原 `control/blueprints.py` 单文件已拆分为 `control/blueprints/` 子包，按运动模式分 4 文件。
 
 ### 依赖
 
@@ -141,7 +141,11 @@ flowchart TD
 - `memory2/vis/utils.py`
 - `experimental/security_demo/`
 
-（原始扫描累计 ≈ 62 个 Python 文件，此处仅列子系统粒度；CI 可通过 `grep -l "^from dimos\.perception" dimos/ -r` 枚举）
+原始扫描累计 ≈ 62 个 Python 文件，此处仅列子系统粒度。参考命令（非 CI 强制）枚举完整文件列表：
+
+```bash
+grep -rl "^from dimos\.perception" dimos/
+```
 
 ---
 
