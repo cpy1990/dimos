@@ -1,10 +1,11 @@
 # 专题：机器人平台（Robot Platforms）
 
-> 与 [README § 5](README.md#-5-机器人平台层) 配套深入：unitree/unitree_webrtc/drone/manipulators/hardware/simulation 各层详解。
+> 与 [README § 5](/docs/architecture/README.md#-5-机器人平台层) 配套深入：unitree/unitree_webrtc/drone/manipulators/hardware/simulation 各层详解。
 > 目标读者：正在接入新机器人平台、末端执行器、传感器或仿真后端的工程师。
 
 ## 目录
 
+- [0. 统一机器人配置层](#0-统一机器人配置层)
 - [1. unitree](#1-unitree)
 - [2. unitree_webrtc](#2-unitree_webrtc)
 - [3. drone](#3-drone)
@@ -13,6 +14,31 @@
 - [6. simulation/](#6-simulation)
 - [7. 蓝图示例](#7-蓝图示例)
 - [8. 添加新平台 / 末端 / 传感器](#8-添加新平台--末端--传感器)
+
+---
+
+## 0. 统一机器人配置层
+
+`dimos/robot/config.py` + `dimos/robot/model_parser.py` + `dimos/robot/catalog/` 一起构成 DimOS 当前的**统一机器人配置层**——替代此前各平台子包里零散的"per-robot 硬编码配置"。**单一真相源 = URDF/MJCF 模型文件**，其余字段（关节拓扑、硬件组件清单、任务配置）由模型文件派生。
+
+**入口层 `robot/config.py`**：
+
+- `RobotConfig(BaseModel)` —— 顶层配置；通常由 `RobotConfig.from_urdf(...)` / `from_mjcf(...)` 从模型文件构造。内部组合 `RobotModelConfig`（解析结果）+ `HardwareComponent` 列表（夹爪、相机、传感器）+ `TaskConfig`（任务/技能开关）。
+- `GripperConfig(BaseModel)` —— 夹爪子配置（型号名、开合量程、控制模式），作为 `HardwareComponent` 的一种挂到 `RobotConfig` 上。
+
+**解析层 `robot/model_parser.py`**：
+
+- `JointDescription` —— 单关节描述（名称、类型、父/子 link、axis、limits）。
+- `ModelDescription` —— 整模型描述（关节列表 + 根 link + 元数据）。
+- `parse_model(path) -> ModelDescription` —— 入口函数，按扩展名分派到 `_parse_urdf_string` / `_parse_mjcf_file`；URDF 走 xacro 展开 + ElementTree 解析，MJCF 走 `_walk_mjcf_bodies` 递归遍历。
+
+**型号目录 `robot/catalog/`**：当前覆盖四家厂商——`openarm.py`、`panda.py`、`piper.py`、`ufactory.py`。每个文件导出该系列的默认 `RobotConfig` 构造器（URDF 路径 + 夹爪默认值 + 任务配置），上层直接 import 即可得到可跑的 `RobotConfig`。
+
+**新机器人接入流程**：
+
+1. 在 `dimos/robot/catalog/<name>.py` 写一个构造函数；准备对应 URDF / MJCF 文件。
+2. 内部调用 `RobotConfig.from_urdf(path, gripper=GripperConfig(...), ...)`；`parse_model` 自动提取关节拓扑。
+3. 在蓝图中注入该 `RobotConfig`，并按 `AGENTS.md` → "blueprint registry" 把新蓝图注册进 `dimos/robot/all_blueprints.py`（**自动生成**，触发 `pytest dimos/robot/test_all_blueprints_generation.py` 重建）。
 
 ---
 
@@ -319,17 +345,52 @@ sensors/
 
 摄像头传感器通过 `spec.py` 中的统一协议对上层模块暴露 `Image` 流，RealSense 同时输出 RGB 与深度图像，ZED 额外输出立体视差与空间坐标。
 
+### 5.5 whole_body/（全身多关节控制 HAL）
+
+`dimos/hardware/whole_body/` 是 `drive_trains/` 与 `manipulators/` 之外的第三类 HAL 范畴，服务于 **≥20 DoF 级双足 + 双臂 + 躯干同步控制**场景（典型平台：G1 人形）。
+
+```
+dimos/hardware/whole_body/
+├── spec.py              # WholeBodyAdapter Protocol + 三类数据 dataclass
+├── registry.py          # 适配器 registry（按名称选实现）
+└── transport/
+    └── adapter.py       # 传输级适配器（封装底层通道）
+```
+
+核心接口：`WholeBodyAdapter`（`whole_body/spec.py`）
+
+```python
+class WholeBodyAdapter(Protocol):
+    def send_command(self, cmd: MotorCommand) -> None: ...
+    def get_state(self) -> tuple[MotorState, IMUState]: ...
+```
+
+数据三件套（均为 dataclass）：
+
+- `MotorCommand`：每电机 `q / dq / kp / kd / tau`（位置/速度/刚度/阻尼/前馈力矩）——PD + 前馈的统一指令模型。
+- `MotorState`：每电机当前 q / dq / 力矩反馈。
+- `IMUState`：躯干姿态（quat / gyro / accel）。
+
+**与兄弟节的区别**：
+
+- `drive_trains/` = 底盘级 `Twist`（m/s + rad/s），单一速度向量驱动整机移动。
+- `manipulators/` = 单臂 / 夹爪轨迹跟踪（≤7 DoF + 末端）。
+- `whole_body/` = **一帧内同步下发全身所有关节**的 PD+前馈指令，对时序一致性要求最高；命令/状态打包粒度完全不同，无法用上述两者表达，因此独立成一层。
+
+**G1 实现指针**：具体实现见 §1.2 G1 节（Batch F 扩写）——`dimos/robot/unitree/g1/wholebody_connection.py` 实现 `WholeBodyAdapter`，将 23/29 DoF 命令序列化为 Unitree SDK DDS 包。
+
 ---
 
 ## 6. simulation/
 
-`dimos/simulation/` 包含四个仿真后端，它们既相互独立又共用同一个 `SimulatorBase` 抽象层：
+`dimos/simulation/` 包含**五个仿真后端**，它们既相互独立又共用同一个 `SimulatorBase` 抽象层：
 
 ```
 dimos/simulation/
 ├── mujoco/          # MuJoCo（主力后端，最成熟）
 ├── genesis/         # Genesis（轻量级，GPU 加速）
 ├── isaac/           # Isaac Sim（NVIDIA，USD 场景）
+├── unity/           # Unity（VLA Challenge 基线，TCP 桥接）
 ├── engines/         # 低层引擎适配（SimulationEngine ABC）
 ├── base/            # SimulatorBase 共享基类
 ├── manipulators/    # 机械臂仿真 Module（xarm7_trajectory_sim）
@@ -337,17 +398,17 @@ dimos/simulation/
 └── sim_blueprints.py # 已发布的仿真蓝图
 ```
 
-### 6.1 四后端横向对比
+### 6.1 五后端横向对比
 
-| 维度 | MuJoCo | Genesis | Isaac Sim | engines/ |
-|---|---|---|---|---|
-| **文件格式** | MJCF XML（`.xml`） | URDF / MJCF / primitive | USD（`.usd`） | MJCF XML |
-| **GPU 需求** | 否（CPU 可运行）| 推荐（CUDA） | 必须（NVIDIA RTX）| 否 |
-| **物理精度** | 高（接触力） | 中等（刚体主导） | 极高（PhysX 5） | 高 |
-| **渲染** | OpenGL（mujoco.viewer） | 内置 rasterizer | RTX 光线追踪 | headless 可选 |
-| **共享内存** | 是（ShmWriter/ShmReader） | 否 | 否 | 否 |
-| **主要用途** | Go2/G1 sim 蓝图、机械臂轨迹 | 快速原型 | 渲染真实感场景 | 机械臂 Module 层 |
-| **成熟度** | 生产级 | 早期集成 | 占位级 | 生产级（xarm） |
+| 维度 | MuJoCo | Genesis | Isaac Sim | Unity | engines/ |
+|---|---|---|---|---|---|
+| **文件格式** | MJCF XML（`.xml`） | URDF / MJCF / primitive | USD（`.usd`） | Unity scene（外部工程） | MJCF XML |
+| **GPU 需求** | 否（CPU 可运行）| 推荐（CUDA） | 必须（NVIDIA RTX）| 取决于 Unity 端 | 否 |
+| **物理精度** | 高（接触力） | 中等（刚体主导） | 极高（PhysX 5） | Unity PhysX（基线级） | 高 |
+| **渲染** | OpenGL（mujoco.viewer） | 内置 rasterizer | RTX 光线追踪 | Unity 原生 | headless 可选 |
+| **共享内存** | 是（ShmWriter/ShmReader） | 否 | 否 | 否（TCP 桥接） | 否 |
+| **主要用途** | Go2/G1 sim 蓝图、机械臂轨迹 | 快速原型 | 渲染真实感场景 | VLA Challenge benchmark | 机械臂 Module 层 |
+| **成熟度** | 生产级 | 早期集成 | 占位级 | benchmark 基线 | 生产级（xarm） |
 
 ### 6.2 MuJoCo 后端（最成熟）
 
@@ -394,6 +455,26 @@ class SimulationEngine(ABC):
 ```
 
 `engines/mujoco_engine.py` 是唯一已实现的引擎。该层的价值在于：机械臂仿真 Module（`simulation/manipulators/sim_module.py`）通过 `engine="mujoco"` 字符串选择引擎，使业务逻辑与具体物理引擎解耦，为日后接入 Genesis 引擎做好了接口预留。
+
+### 6.6 Unity 后端（VLA Challenge 基线）
+
+`dimos/simulation/unity/` 是为 VLA Challenge benchmark 准备的第五个仿真后端；它不复用 `engines/` 抽象，而是直接实现为一个独立的 `Module`。
+
+```
+dimos/simulation/unity/
+├── module.py       # UnityBridgeModule(Module) + UnityBridgeConfig(ModuleConfig)
+└── blueprint.py    # 运行入口蓝图
+```
+
+核心：
+
+- `UnityBridgeModule(Module)`（`unity/module.py`）—— 在 DimOS 侧作为标准 Module 运行；对外通过 [ROS-TCP-Endpoint](https://github.com/Unity-Technologies/ROS-TCP-Endpoint) 的**二进制协议**与运行在另一进程/另一主机上的 Unity 仿真器通信，解析 Unity 发来的传感器帧并把指令回写。
+- `UnityBridgeConfig(ModuleConfig)`（同文件）—— 桥接配置（host / port / topic 映射等）。
+- `unity/blueprint.py` —— autoconnect 装配的可运行蓝图，作为 VLA Challenge 基线入口。
+
+**关键点**：**DimOS 侧无 ROS 依赖**。`ROS-TCP-Endpoint` 只是一套 TCP 二进制协议格式——它允许 Unity 端装 ROS package 来通信，但 DimOS 侧只需要按该协议编解码字节流，**不需要运行 ROS master、不需要 rosdep、不需要 `source setup.bash`**。这与 `unitree/rosnav.py` 真正依赖 ROS 2 的情况完全不同。
+
+**与其他四后端对比**：MuJoCo 主打**物理真实**（接触力、共享内存时序）；Genesis 主打 GPU 加速**高吞吐**原型；Isaac Sim 主打 **GPU 并行 + USD 渲染**训练；Unity 主打 **VLA Challenge benchmark 基线**（外部仿真器，TCP 桥接，场景与物理都托付给 Unity 工程）；`engines/` 则是"后端抽象层 + registry"，目前只包机械臂 Module 使用。
 
 ---
 
@@ -548,8 +629,8 @@ dimos/hardware/sensors/lidar/<vendor>/
 
 ## 扩展阅读
 
-- 总览：[README](README.md)
-- Module / Blueprint / GlobalConfig 架构：[`docs/usage/modules.md`](../usage/modules.md)
-- 代理系统与 `@skill`：[`docs/architecture/agent-stack.md`](agent-stack.md)
-- 运行时模型与传输层：[`docs/architecture/runtime-model.md`](runtime-model.md)
+- 总览：[README](/docs/architecture/README.md)
+- Module / Blueprint / GlobalConfig 架构：[`docs/usage/modules.md`](/docs/usage/modules.md)
+- 代理系统与 `@skill`：[`docs/architecture/agent-stack.md`](/docs/architecture/agent-stack.md#L3)
+- 运行时模型与传输层：[`docs/architecture/runtime-model.md`](/docs/architecture/runtime-model.md)
 - 平台配置：[`docs/platforms/`](../platforms/)

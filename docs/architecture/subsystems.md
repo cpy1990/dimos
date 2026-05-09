@@ -187,6 +187,28 @@ C++ 加速内核 `min_cost_astar_ext.so` 是预编译二进制，在 `replanning
 
 详见：[`docs/capabilities/navigation/`](../capabilities/navigation/)。
 
+### 自主巡逻 — navigation/patrolling/
+
+`dimos/navigation/patrolling/` 是 navigation 下的**任务层**子包，也是 DimOS 当前生产级 **async Module** 范式的代表示例（**async Module 运行时机制见 runtime-model §1.8**）。`PatrollingModule` 通过 `asyncio` 协程并发监听 `odom` / `global_costmap` / `goal_reached` 三条 stream，驱动"选下一个巡逻点 → 调用规划器 → 等待到达 → 更新访问历史"的主循环；其 e2e 行为覆盖于 `dimos/e2e_tests/test_patrol_and_follow.py`。
+
+```
+dimos/navigation/patrolling/
+├── module.py                        # PatrollingModule(Module) — async 巡逻主循环
+├── patrolling_module_spec.py        # PatrollingModuleSpec(Spec, Protocol) — RPC 契约
+├── create_patrol_router.py          # Router factory（按名称装配 router）
+└── routers/
+    ├── patrol_router.py             # PatrolRouter(Protocol) — 下一目标选择器契约
+    ├── base_patrol_router.py        # BasePatrolRouter(ABC) — 访问历史集成基类
+    ├── coverage_patrol_router.py    # CoveragePatrolRouter — 栅格覆盖策略
+    ├── frontier_patrol_router.py    # FrontierPatrolRouter — 前沿探索策略
+    ├── random_patrol_router.py      # RandomPatrolRouter — 随机游走基线
+    └── visitation_history.py        # VisitationHistory — 访问栅格记账
+```
+
+**Router 插拔体系**：`PatrolRouter` Protocol 约定单一方法"给定当前 pose + costmap + 访问历史 → 返回下一个 goal"。`BasePatrolRouter` 负责装配 `VisitationHistory`，三个子类仅实现选点策略——`Coverage` 扫未访问栅格中心、`Frontier` 去前沿边界、`Random` 采样空闲栅格；新策略只需继承 `BasePatrolRouter` 并实现 `next_goal()`，通过 `create_patrol_router` 工厂按字符串选型。
+
+**与其他 navigation 子节的关系**：`patrolling/` 位于**任务层**，其规划下调 `replanning_a_star/` + `frontier_exploration/` 生成路径，与 `visual_servoing/`、`bbox_navigation/` 是平级的任务模式——共享 `Nav` Spec（`goal_req` / `goal_active`），不同点只在"如何选下一个 goal"。
+
 ---
 
 ## 4. manipulation/

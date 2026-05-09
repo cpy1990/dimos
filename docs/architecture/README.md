@@ -640,8 +640,11 @@ dimos/robot/
 ├── manipulators/                   # 机械臂平台
 │   ├── piper/
 │   └── xarm/                      # xArm（稳定主线）
+├── catalog/                        # 统一机器人型号目录（openarm / panda / piper / ufactory）
 ├── cli/                            # CLI 入口（dimos.py）
 ├── utils/                          # 调试工具（robot_debugger.py）
+├── config.py                       # RobotConfig / GripperConfig —— 统一配置入口
+├── model_parser.py                 # URDF/MJCF → JointDescription / ModelDescription
 ├── foxglove_bridge.py              # Foxglove WebSocket 桥接
 ├── ros_command_queue.py            # ROS 命令队列
 ├── position_stream.py              # 位置流（RxPY Observable）
@@ -692,6 +695,7 @@ flowchart TB
 | `end_effectors/` | 末端执行器（夹爪、工具头等） |
 | `manipulators/` | 机械臂硬件规格（含 piper、xArm 的 `spec.py` / `registry.py`） |
 | `sensors/` | 传感器抽象（相机、激光雷达等） |
+| `whole_body/` | 全身多关节控制 HAL（`WholeBodyAdapter` + `MotorCommand` / `MotorState` / `IMUState`，G1 级 ≥20 DoF 同步） |
 
 #### `dimos/simulation/` — 多引擎仿真
 
@@ -700,6 +704,7 @@ flowchart TB
 | `mujoco/` | MuJoCo 物理仿真（最成熟，含进程管理与 stream） |
 | `genesis/` | Genesis 仿真后端（`simulator.py` + `stream.py`） |
 | `isaac/` | Isaac Sim 后端（`simulator.py` + `stream.py`） |
+| `unity/` | Unity 后端（VLA Challenge 基线，TCP 桥接，`UnityBridgeModule`） |
 | `engines/` | 统一引擎接口（`mujoco_engine.py`、`base.py`、`registry.py`） |
 | `base/` | Simulator/Stream 基类（`simulator_base.py`、`stream_base.py`） |
 | `manipulators/` | 仿真内机械臂接口（`sim_module.py`、`sim_manip_interface.py`） |
@@ -908,6 +913,7 @@ dimos/navigation/
 ├── visual_servoing/
 │   ├── visual_servoing_2d.py  # 2D 视觉伺服控制器（像素→Twist）
 │   └── detection_navigation.py # 基于检测的导航 Module
+├── patrolling/                # 自主巡逻任务层（async Module，Coverage/Frontier/Random routers）
 ├── bbox_navigation.py         # BBoxNavigationModule（按检测框导航）
 ├── visual/
 │   └── query.py               # 视觉语义查询辅助
