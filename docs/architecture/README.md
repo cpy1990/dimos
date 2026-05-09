@@ -153,12 +153,18 @@ classDiagram
     +returns str
     +auto JSON schema
   }
+  class AgentSpec {
+    <<Protocol>>
+    +add_message(msg) None
+    +dispatch_continuation() None
+  }
   class AgentSpecImpl {
     +Spec Protocol refs
     +LLM tool calls
   }
   Blueprint o-- Module : 包含并编排
   Module <|-- SkillContainer : Skill 容器是\nModule 子类
+  AgentSpec <|.. AgentSpecImpl : 实现 Protocol\n(McpClient / demo_agent / ...)
   AgentSpecImpl ..> SkillContainer : 通过 Spec Protocol\n引用 @skill 方法
 ```
 
@@ -456,7 +462,7 @@ classDiagram
 
 `dimos/agents_deprecated/` 是历史遗留包，包含旧式 OpenAI/Claude agent 实现（`agent.py` 定义了 `LLMAgent` 和 `OpenAIAgent`，还有 `claude_agent.py`、`memory/`、`modules/`、`prompt_builder/`、`tokenizer/` 等子包）。目前仓库内 `dimos/web/dimos_interface/api/README.md` 还留有 `from dimos.agents_deprecated.agent import OpenAIAgent` 的过渡性引用。
 
-**新代码中严禁使用 `dimos/agents_deprecated/`**。典型陷阱：对 `class\s+Agent` 做仓库级 grep 会命中 `dimos/agents_deprecated/agent.py`（历史，仍定义 `LLMAgent` / `OpenAIAgent`），而当前体系已不存在 `dimos/agents/agent` 单体 Module——改由 `AgentSpec` Protocol + `demo_agent` 模板承担（见上表）。误导入已废弃 API 后，在调用 `start()` 或加入 blueprint 时才报错。判断方法：检查路径是否含 `_deprecated`，或类是否继承 `Module`（当前体系）。新代码请实现 `dimos.agents.agent_spec.AgentSpec` Protocol，或以 `demo_agent` / `demo_agent_camera` blueprint 为模板。
+**新代码中严禁使用 `dimos/agents_deprecated/`**。典型陷阱：对 `class\s+Agent` 做仓库级 grep 会命中 `dimos/agents_deprecated/agent.py`（历史，仍定义 `LLMAgent` / `OpenAIAgent`），而当前体系已不存在 `dimos/agents/agent.py` 单体 Module（该文件历史上存在，已从仓库删除）——改由 `AgentSpec` Protocol + `demo_agent` 模板承担（见上表）。误导入已废弃 API 后，在调用 `start()` 或加入 blueprint 时才报错。判断方法：检查路径是否含 `_deprecated`，或类是否继承 `Module`（当前体系）。新代码请实现 `dimos.agents.agent_spec.AgentSpec` Protocol，或以 `demo_agent` / `demo_agent_camera` blueprint 为模板。
 
 #### 关键避坑（命名重叠 4）：两套 skills 体系
 

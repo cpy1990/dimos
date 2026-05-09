@@ -35,7 +35,7 @@ class AgentSpec(Spec, Protocol):
 - `add_message(message)`：把一条消息（通常是 `HumanMessage` / tool-result / system message 的 dict 形式）写入 agent 的会话历史。
 - `dispatch_continuation()`：触发一次"继续推理"——让实现者决定用什么 LLM、上什么历史、调什么工具。
 
-**运行时形态就是"任何 AgentSpec 实现者 + 任何 McpClient/MCP tools 组合"**。没有 base class——早期的 `dimos/agents/agent` 单体 Module 文件已从仓库删除。新实现只要满足 Protocol 就能被 `autoconnect` 识别成 agent 角色。
+**运行时形态就是"任何 AgentSpec 实现者 + 任何 McpClient/MCP tools 组合"**。没有 base class——历史上的 `dimos/agents/agent.py` 单体 Module 文件已从仓库删除。新实现只要满足 Protocol 就能被 `autoconnect` 识别成 agent 角色。
 
 ### 1.2 VLM 孪生：VLMAgentSpec
 
@@ -103,6 +103,8 @@ def get_skills(self) -> list[SkillInfo]:
 ```
 
 关键路径：`tool(attr)`（内置的 `@tool` 工具适配器工厂）→ `.args_schema`（Pydantic 模型）→ `.model_json_schema()`（JSON Schema 字典）→ `json.dumps` → `SkillInfo.args_schema` 字段。
+
+**实现注脚**：上面的 `tool(attr)` 即 `from langchain_core.tools import tool`（LangChain 的 `@tool` 工厂）——DimOS 的 `@skill` 装饰器只打属性标记，真正的 args schema 是靠 `langchain_core.tools.tool()` 基于函数签名生成 Pydantic 模型后序列化而成。这是当前 schema 生成对 LangChain 的依赖点之一；`McpClient` 的推理循环与 `StructuredTool` 构造同样走 LangChain（详见 [§5.3 实现注脚](#53-mcpclient进程内模块连接远端-mcpserver)）。Protocol 契约本身不依赖任何特定框架——替换掉 LangChain 需要同时改 `get_skills()` 的 schema 工厂与所有现存实现者，但不影响 `AgentSpec` / `VLMAgentSpec` 的对外契约。
 
 ### 2.2 schema 生成的 4 条铁律
 
@@ -426,6 +428,8 @@ McpAdapter             ← 纯 Python 辅助类（非 Module！）
 
 `_fetch_tools` 会轮询 `mcp_server_url`（默认 `http://localhost:9990/mcp`），调用 `initialize` 握手，再调用 `tools/list` 获取工具列表，将其转换为进程内工具适配器对象。图像类工具的响应同样通过追加到历史的方式处理。
 
+**实现注脚**：当前 `McpClient` 内部通过 `from langchain.agents import create_agent`（`mcp_client.py:23`）构建推理循环——`self._state_graph = create_agent(...)`（`:222`）把 LLM 节点 + 工具节点拼成一张 LangGraph 状态图。`_fetch_tools` 把 MCP `tools/list` 响应经 `_mcp_tool_to_langchain`（`:166`）转为 `langchain_core.tools.StructuredTool`（导入自 `:26`；`:133` / `:188` 为构造位点）。这些是 `McpClient` 当前的实现细节，**不是** `AgentSpec` Protocol 契约的一部分——Protocol 只要求 `add_message` + `dispatch_continuation`，任何其他实现者（自研 ReAct 循环、直接调 OpenAI SDK 等）都可以在不依赖 LangChain 的前提下满足契约。
+
 ### 5.4 McpAdapter：纯 Python 辅助类（非 Module）
 
 **`dimos/agents/mcp/mcp_adapter.py`**
@@ -510,7 +514,7 @@ McpServer（另一进程）订阅 /tool_streams 一次
 
 ### 6.1 运行时组合 — 没有"标准 Agent 类"
 
-早期的 `dimos/agents/agent` 单体 Module 已从仓库删除。Agent 的运行时形态由"**实现 `AgentSpec` Protocol 的 Module** + **任意 MCP tools / skills 组合**"决定，没有唯一的标准类供继承。具体契约、目前的 Protocol 实现者（`McpClient` / `VLMAgent` 等）与模板蓝图（`demo_agent` / `demo_agent_camera`）见 [§1 Agent 内部循环](#1-agent-内部循环)；MCP 相关细节见 [§5 MCP 三件套](#5-mcp-三件套)。
+历史上的 `dimos/agents/agent.py` 单体 Module 已从仓库删除。Agent 的运行时形态由"**实现 `AgentSpec` Protocol 的 Module** + **任意 MCP tools / skills 组合**"决定，没有唯一的标准类供继承。具体契约、目前的 Protocol 实现者（`McpClient` / `VLMAgent` 等）与模板蓝图（`demo_agent` / `demo_agent_camera`）见 [§1 Agent 内部循环](#1-agent-内部循环)；MCP 相关细节见 [§5 MCP 三件套](#5-mcp-三件套)。
 
 ### 6.2 `VLMAgent`（`dimos/agents/vlm_agent.py`）——视觉语言智能体
 
@@ -529,6 +533,8 @@ McpServer（另一进程）订阅 /tool_streams 一次
 **工作模式**：`VLMAgent` 订阅 `color_image` 流，每次新图像到来时暂存为 `_latest_image`。当 `query_stream` 收到 `HumanMessage` 时，将最新图像和查询文本组合（通过 `image.agent_encode()` 转为多模态内容）调用 LLM，将 `AIMessage` 发布到 `answer_stream`。
 
 `VLMAgent` 同样支持 `"ollama:"` 前缀路由，由 `ensure_ollama_model`（`dimos/agents/ollama_agent.py`）在启动时拉取本地模型。
+
+**实现注脚**：`VLMAgent` 内部通过 `from langchain.chat_models import init_chat_model`（`vlm_agent.py:17`）做模型路由——`"ollama:<model>"` 前缀交给 Ollama 后端，其他走对应 provider。和 `McpClient` 一样，这是当前实现对 LangChain 的依赖点，不是 `VLMAgentSpec` Protocol 的契约。
 
 ### 6.3 `WebInput`（`dimos/agents/web_human_input.py`）——非 Agent 输入桥接模块
 
