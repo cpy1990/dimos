@@ -298,7 +298,7 @@ DimOS 使用 Python 的 `forkserver` 启动上下文（`multiprocessing.get_cont
 
 `forkserver` 预先 fork 出干净的守护进程，每次需要 worker 时由它从干净状态 fork 子进程并通过 pipe 传入模块代码，因此每个 worker 都从零 CUDA/socket 状态启动。相比 `spawn`（重新执行解释器）启动更快，任何 worker 崩溃只影响自身，不波及其他 worker。
 
-#### 协调层双轨：Python 与 Docker
+#### 协调层双轨
 
 DimOS 的进程管理层围绕 **`ModuleCoordinator`**（`dimos/core/coordination/module_coordinator.py`）展开，它持有一张 `deployment_identifier → WorkerManager` 字典，同时驱动 **`WorkerManagerPython`**（`worker_manager_python.py`，forkserver 子进程池）和 **`WorkerManagerDocker`**（`worker_manager_docker.py`，容器编排轨）两条部署路径——`ModuleBase.deployment` 类属性（`"python"` 或 `"docker"`）决定单个模块走哪条轨。
 
@@ -306,7 +306,7 @@ DimOS 的进程管理层围绕 **`ModuleCoordinator`**（`dimos/core/coordinatio
 
 **当 `n_workers` 小于 Python 模块总数时**，多个模块共享同一 worker 进程；若某模块 CPU 密集，会挤占同 worker 内其他模块的响应延迟。
 
-#### IPC：rpyc 为主
+#### rpyc IPC
 
 当前运行时的主 IPC 是 **rpyc**：`RpycServer`（`coordination/rpyc_server.py`）在 coordinator 启动时占一个 `ThreadedServer` 端口（端口号写进 `RunEntry.rpyc_port`）、对外暴露 `CoordinatorService` 和 `WorkerRpycService` 两类 service；客户端 `RPCClient` / `ModuleProxyProtocol`（`dimos/core/rpc_client.py`）是 host 侧句柄的统一抽象。rpyc 同时覆盖 daemon 内部协调与 out-of-process 客户端发现，本地 / 远程走同一管道。展开见 runtime-model.md §1.4。
 
