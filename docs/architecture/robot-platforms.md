@@ -357,6 +357,8 @@ dimos/hardware/whole_body/
     └── adapter.py       # 传输级适配器（封装底层通道）
 ```
 
+- `transport/adapter.py` — 传输级适配器基类（LCM / rpyc 两路注入 `MotorCommand` / `MotorState`；平台实现按传输差异化）。
+
 核心接口：`WholeBodyAdapter`（`whole_body/spec.py`）
 
 ```python
