@@ -280,7 +280,7 @@ DimOS 的 JSONL 日志路径取决于运行模式：
 
 ```jsonl
 {"timestamp": "2026-05-06T14:23:01.456789Z", "level": "info", "logger": "dimos.core.coordination.module_coordinator", "event": "Worker pool started.", "n_workers": 2, "func_name": "start", "lineno": 93}
-{"timestamp": "2026-05-06T14:23:02.100Z", "level": "info", "logger": "dimos.core.blueprints", "event": "Transport", "name": "video_out", "original_name": "video_out", "topic": "/video_out", "type": "dimos.msgs.image.Image", "module": "CameraModule", "transport": "pLCMTransport", "func_name": "_connect_streams", "lineno": 304}
+{"timestamp": "2026-05-06T14:23:02.100Z", "level": "info", "logger": "dimos.core.coordination.blueprints", "event": "Transport", "name": "video_out", "original_name": "video_out", "topic": "/video_out", "type": "dimos.msgs.image.Image", "module": "CameraModule", "transport": "pLCMTransport", "func_name": "_connect_streams", "lineno": 304}
 {"timestamp": "2026-05-06T14:23:05.201Z", "level": "error", "logger": "dimos.core.worker", "event": "Worker error", "error": "RuntimeError: ...", "func_name": "deploy_module", "lineno": 220}
 ```
 

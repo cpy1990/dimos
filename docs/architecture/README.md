@@ -768,7 +768,7 @@ dimos/control/
 
 `perception/` 将原始相机帧转化为结构化语义信息。架构拆为三层：**检测核心**（纯算法，无 Module 依赖）、**上层封装**（时序融合、ReID、空间注册）、**实验性时序记忆**（基于 RAG 的时空语义检索）。三层相互解耦，可独立替换内部实现。
 
-**可选 extra**（PR #1888）：安装时用 `uv sync --extra perception`；跨子系统硬依赖清单见批 G。
+**可选 extra**（PR #1888）：安装时用 `uv sync --extra perception`；详细硬依赖子系统清单见 `subsystems.md` §2 perception。
 
 **关键文件**
 
@@ -1284,7 +1284,7 @@ Agent 调用 `skills.speak` skill，将"到了"文本转换为语音并播放给
 | 控制 | `control.tick_loop` | `JointCmd` | DDS / SHM |
 | TTS | `skills.speak` | RPC | LCM |
 
-> **更深入**：详细字段级 trace、`--replay` 模式差异、manipulation 路径见 [`data-flow.md`](/docs/architecture/data-flow.md#L3)。
+> **更深入**：详细字段级 trace、`--replay` 模式差异、manipulation 路径见 [data-flow.md](/docs/architecture/data-flow.md)。
 
 ### § 8. 怎么继续读 + 常见踩坑
 

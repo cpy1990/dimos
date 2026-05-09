@@ -74,7 +74,7 @@ flowchart LR
 
 ## 2. perception/
 
-> 做什么见 [README § 6.2](/docs/architecture/README.md#-6-能力子系统全景)。本节聚焦内部架构、依赖、扩展点。**安装注意**：`perception` 子系统自 PR #1888 起从基础安装移出为 pip extra，按需 `uv sync --extra perception` 装入；详细硬依赖清单见批 G.10。
+> 做什么见 [README § 6.2](/docs/architecture/README.md#-6-能力子系统全景)。本节聚焦内部架构、依赖、扩展点。**安装注意**：`perception` 子系统自 PR #1888 起从基础安装移出为 pip extra，按需 `uv sync --extra perception` 装入；详细硬依赖子系统清单见本文档"跨子系统硬依赖"小节（§2 末尾）。
 
 ### 内部架构
 
