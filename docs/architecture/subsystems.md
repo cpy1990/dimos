@@ -305,7 +305,7 @@ flowchart LR
 
 > 做什么见 [README § 6.6](/docs/architecture/README.md#-6-能力子系统全景)。本节聚焦内部架构、依赖、扩展点。
 
-memory/ 子系统由两块组成：**`memory2/`（主）** 是以 `Stream[T]` / `Transformer[T,R]` / `StreamModule` 为核心的通用存储抽象栈，承接图像、点云、嵌入、体素地图等所有持久化与流式处理需求；**`memory/timeseries/`（辅）** 是通用时序 KV 后端（5 实现），主要被 `--replay` 数据集加载与老代码路径使用。历史遗留的 `memory/embedding.py` 是未完成原型、**零非测试调用**，职责已被 `memory2.SemanticSearch` 吸收——详见 §6.5。（`Stream` / `Transformer` / `StreamModule`）
+memory/ 子系统由两块组成：**`memory2/`（主）** 是以 `Stream[T]` / `Transformer[T,R]` / `StreamModule` 为核心的通用存储抽象栈，承接图像、点云、嵌入、体素地图等所有持久化与流式处理需求；**`memory/timeseries/`（辅）** 是通用时序 KV 后端（5 实现），主要被 `--replay` 数据集加载与老代码路径使用。历史遗留的 `memory/embedding.py` 是未完成原型、**零非测试调用**，职责已被 `memory2.SemanticSearch` 吸收——详见 §6.5。
 
 ```mermaid
 flowchart LR

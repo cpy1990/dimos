@@ -247,7 +247,7 @@ sequenceDiagram
   VGM-->>DS: global_map: Out[PointCloud2]<br/>（经 stream_to_port 推回 Module Out 端口）
 ```
 
-`VoxelGridMapper`（`dimos/mapping/voxels.py:253`，`StreamModule[PointCloud2, PointCloud2]`）是 memory2 抽象栈在业务子系统的典型用法。`start()` 在 `StreamModule` 基类里自动做三件事：(1) 建 `NullStore` + `.stream(in_name, PointCloud2)` 拿到 pull-based stream；(2) 把 `lidar: In[PointCloud2]` port 的推式消息 `subscribe` 到 `stream.append`；(3) 把 `pipeline(stream.live())` 的输出经 `stream_to_port(..., global_map)` 推回 `Out[PointCloud2]` 端口。变换本体是 `VoxelMapTransformer(Transformer[PointCloud2, PointCloud2])`（`dimos/mapping/voxels.py:192`）——**它住在 `mapping/` 而非 `memory2/`**，遵循 memory2 "通用 ABC 在 memory2，领域变换就近放业务子系统" 的分工原则。详见 [subsystems § 6.4](/docs/architecture/subsystems.md#64-集成示例)。
+`VoxelGridMapper`（`StreamModule[PointCloud2, PointCloud2]`）是 memory2 抽象栈在业务子系统的典型用法。`start()` 在 `StreamModule` 基类里自动做三件事：(1) 建 `NullStore` + `.stream(in_name, PointCloud2)` 拿到 pull-based stream；(2) 把 `lidar: In[PointCloud2]` port 的推式消息 `subscribe` 到 `stream.append`；(3) 把 `pipeline(stream.live())` 的输出经 `stream_to_port(..., global_map)` 推回 `Out[PointCloud2]` 端口。变换本体是 `VoxelMapTransformer(Transformer[PointCloud2, PointCloud2])`——**它住在 `mapping/` 而非 `memory2/`**，遵循 memory2 "通用 ABC 在 memory2，领域变换就近放业务子系统" 的分工原则。详见 [subsystems § 6.4](/docs/architecture/subsystems.md#64-集成示例)。
 
 ### 2.7 tool streams 事件流 —— @skill 后台进度 → MCP SSE
 

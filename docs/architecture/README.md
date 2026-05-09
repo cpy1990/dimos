@@ -736,7 +736,7 @@ DimOS CLI 通过三个互斥（或组合）标志控制运行时后端：
 
 ### § 6. 能力子系统全景
 
-DimOS 现有 **14 个一级子系统**。以下按职责拓扑排序，**核心 8 项每项详写**，**辅助 5 项每项简介**（外加 `stream/` 与新列格在 §14 Batch G 补齐）。每项末尾给"链到现有 docs/"，让读者按需深入。各子系统在代码层面均以 `dimos/<subsystem>/` 顶层包形式存在，通过 RxPY `Observable` stream 互联，不持有跨系统的直接对象引用。
+DimOS 现有 **14 个一级子系统**（8 核心 + 5 辅助 + 1 外部数据源 `stream/`）。以下按职责拓扑排序，**核心 8 项每项详写**，**辅助 5 项每项简介**；`stream/` 暂为占位，正文见 [`subsystems.md` §14](/docs/architecture/subsystems.md)。每项末尾给"链到现有 docs/"，让读者按需深入。各子系统在代码层面均以 `dimos/<subsystem>/` 顶层包形式存在，通过 RxPY `Observable` stream 互联，不持有跨系统的直接对象引用。
 
 ```mermaid
 flowchart LR
