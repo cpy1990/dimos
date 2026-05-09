@@ -17,60 +17,73 @@
 
 ## 1. 进程模型
 
-### 1.1 三层类关系
+DimOS 运行时 = **协调层（`dimos/core/coordination/`）+ 双 worker 轨（Python / Docker）+ rpyc IPC + watchdog sidecar + 动态 blueprint 装卸**。一个 `ModuleCoordinator` 同时管理 Python 进程池与 Docker 容器池，对外通过 rpyc 暴露发现与调用通道。旧版的 `multiprocessing.Pipe` 单一 IPC 已被 rpyc 整体替代，仅在 worker 内部短链路仍作为 worker_messages 传输协议使用。
 
-DimOS 的进程层由三个类协作完成——`ModuleCoordinator`、`WorkerManager`、`Worker`——职责严格分层：
-
-```
-ModuleCoordinator          ← 业务编排层（蓝图构建、模块生命周期）
-  └─ WorkerManager         ← 进程池层（n 个 Worker 的分配与管理）
-       └─ Worker × n       ← 单个工作进程（通过 Pipe 接收指令，托管多个 Module）
-```
-
-**ModuleCoordinator**（`dimos/core/coordination/module_coordinator.py`）是蓝图（Blueprint）调用的直接对象。它持有一个 `WorkerManager` 实例，并维护一张 `{Module 类 → ModuleProxy}` 字典，记录已部署的全部模块。核心方法 `deploy` / `deploy_parallel` 将模块类路由到合适的 Worker，并将返回的 `RPCClient` 包装为 `ModuleProxy` 对外暴露。蓝图 `build()` 完成后，调用 `health_check()` 验证所有 Worker 的 PID 仍然存活；`stop()` 则以反序优雅地停止每个模块，最后关闭整个进程池。
-
-**WorkerManager**（`dimos/core/coordination/worker_manager.py`）管理固定数量的 `Worker`，默认 `n_workers=2`。`start()` 一次性启动全部 Worker 进程；`deploy()` / `deploy_parallel()` 使用最小负载（min by `module_count`）策略选择目标 Worker。`deploy_parallel` 先顺序分配（保证计数准确），再用 `ThreadPoolExecutor` 并发发送部署请求，显著缩短多模块蓝图的启动时间。
-
-**Worker**（`dimos/core/coordination/python_worker.py`）每个实例对应一个独立的子进程。进程通信通道是 `multiprocessing.Pipe`（一对 `Connection` 对象）。Worker 内部维护 `{module_id → Actor}` 字典；每次收到 `deploy_module` 消息就实例化对应的 Module 类，并回传成功响应；后续 RPC 调用（`call_method`、`getattr`、`set_ref`）通过同一条 Pipe 串行传递，由 `threading.Lock` 保证请求-响应的一对一匹配。
-
-### 1.2 forkserver vs fork
-
-DimOS 固定使用 `forkserver` 上下文（`multiprocessing.get_context("forkserver")`），而非默认的 `fork`：
-
-```python
-# dimos/core/coordination/python_worker.py
-_forkserver_ctx = multiprocessing.get_context("forkserver")
+```mermaid
+flowchart LR
+  MC["ModuleCoordinator<br/>coordination/module_coordinator.py"] --> WMP["WorkerManagerPython<br/>deployment_identifier='python'"]
+  MC --> WMD["WorkerManagerDocker<br/>deployment_identifier='docker'"]
+  WMP --> PW["PythonWorker × n<br/>forkserver + Pipe"]
+  WMD --> DMP["DockerModuleProxy<br/>core/docker_module.py"]
+  MC --- RS["RpycServer<br/>ThreadedServer"]
+  RS <-->|rpyc| RC["RPCClient / ModuleProxyProtocol<br/>core/rpc_client.py"]
+  MC --- WD["watchdog sidecar<br/>coordination/watchdog_main.py"]
 ```
 
-选择 `forkserver` 的原因：
+### 1.1 协调层双轨
 
-| 维度 | `fork` | `forkserver` |
-|---|---|---|
-| CUDA 上下文 | 继承父进程 CUDA context，极易损坏 | 全新进程，不继承 GPU 状态 |
-| 多线程安全 | fork 后子进程只有一个线程，持有的锁可能永久死锁 | 子进程从干净状态启动 |
-| 文件描述符泄露 | 父进程所有 fd 均继承 | 只传递显式 Pipe |
-| 启动速度 | 最快（写时复制） | 稍慢（需要序列化 module_class 并通过 Pickle 传送） |
-| 适用场景 | 纯 Python、无 GPU、无复杂线程 | GPU / ROS / 多线程框架（DimOS 的选择） |
+`ModuleCoordinator`（`dimos/core/coordination/module_coordinator.py:46`）继承自 `Resource`，是蓝图调用的入口。它持有 `_managers: dict[str, WorkerManager]`（`module_coordinator.py:47`），key 是 deployment 字面值；构造时（`module_coordinator.py:57`）以 `{cls.deployment_identifier: cls(g=g) for cls in manager_types}` 字典推导装填——`manager_types` 固定为 `[WorkerManagerDocker, WorkerManagerPython]`。
 
-代价是 `forkserver` 要求传递给子进程的所有对象必须可 Pickle，因此 `Module` 类不能携带不可序列化的属性（如 `asyncio.Event`、锁等）——这也是 `Module.__getstate__` 手动剥离 `_disposables`、`_loop`、`_rpc` 等属性的原因。
+`WorkerManager` 是一个 Protocol（`dimos/core/coordination/worker_manager.py:29`），关键字段 `deployment_identifier: str`（`worker_manager.py:30`），方法面 `start` / `deploy` / `deploy_parallel` / `stop` / `health_check` / `suppress_console`。两份生产实现平行并存：`WorkerManagerPython`（`worker_manager_python.py:33`，`deployment_identifier: str = "python"` 在 `:34`）、`WorkerManagerDocker`（`worker_manager_docker.py:32`，`deployment_identifier: str = "docker"` 在 `:33`）。
 
-### 1.3 Actor / MethodCallProxy 代理模式
+职责分工：Python 轨维护一组 forkserver 子进程（`n_workers` 个，可通过 `add_workers(n)` 增量扩容）、按最小负载（`min by module_count`）挑选 worker；Docker 轨不管进程池，每次 `deploy` 直接新建一个 `DockerModuleProxy` 负责容器编排。单个 `ModuleBase.deployment` 类属性决定该模块走哪条轨。
 
-`Actor` 是父进程持有的远程代理对象（Proxy）。它本身不包含任何 Module 状态，所有属性访问和方法调用都被 `__getattr__` 截获，通过 `Pipe.send()/recv()` 路由到子进程执行，再把结果同步返回。`MethodCallProxy` 是一个更轻量的包装，用于 `RemoteOut/RemoteIn` 的 `set_transport` 调用，让返回值符合 `ActorFuture.result()` 接口。
+### 1.2 Python 轨：forkserver 子进程 + 消息协议
 
-### 1.4 ModuleCoordinator 启动序列
+`PythonWorker`（`coordination/python_worker.py:170`）代表一个被 `WorkerManagerPython` 持有的子进程句柄。`start_process()` 向全局 forkserver context（`python_worker.py:148-157` 的 `_forkserver_ctx`，惰性初始化）请求一对 `multiprocessing.Pipe` 并 `ctx.Process(...).start()` 生成子进程；`deploy_module(module_class, g, kwargs)` 通过 pipe 发送请求消息并收响应。每个 worker 进程可以托管多个 module，`_select_worker()` 按 `module_count` 最小的 worker 做负载分配；`deploy_parallel` 先顺序预占 slot（`reserve_slot()`，`worker_manager_python.py:156`）再用 `safe_thread_map` 并发提交，避免负载统计抖动。`add_workers(n)`（`:60`）允许在运行中扩容 worker 池——这是 blueprint 动态加载（§1.5）按需扩容的依据。
 
-```
-blueprint.build(coordinator)
-  ├─ coordinator.start()          → WorkerManager.start() → 启动 n 个 Worker 进程
-  ├─ coordinator.deploy_parallel(module_specs)
-  │    ├─ 为每个模块选 Worker（min module_count）
-  │    └─ ThreadPoolExecutor → Worker.deploy_module() × n（并发）
-  ├─ _connect_streams()           → 为每个 In/Out 设置 Transport
-  ├─ coordinator.start_all_modules()
-  │    └─ ThreadPoolExecutor → module.start() × n（并发）
-  └─ coordinator.health_check()   → 检查所有 Worker PID 存活
-```
+worker 消息协议集中在 `coordination/worker_messages.py`（PR #1767）：请求侧 `WorkerRequest`（`:70`）是 `DeployModuleRequest | SetRefRequest | GetAttrRequest | CallMethodRequest | UndeployModuleRequest | SuppressConsoleRequest | StartRpycRequest | ShutdownRequest` 的 union；响应侧统一为 `WorkerResponse(result, error)`（`:83`）。这套消息只在 parent → worker 的短链路内流通，不跨进程边界。forkserver 比默认 `fork` 的关键优势是：子进程从干净的 Python 状态启动，不继承父进程的 CUDA context、LCM socket、线程锁，代价是 `module_class` 与 kwargs 必须全部 picklable。
+
+### 1.3 Docker 轨
+
+`WorkerManagerDocker` 极为轻量：没有进程池概念，`start()` 为 no-op，`deploy()` / `deploy_parallel()` 直接把 `module_class` 包进一个新的 `DockerModuleProxy` 实例并记入 `_deployed` 列表。`DockerModuleProxy`（`dimos/core/docker_module.py:113`）**住在 `core/` 顶层而非 `coordination/` 子目录**——这是排查调用链时常见的混淆点，代码引用一定要写全前缀。`DockerModuleProxy` 实现 `ModuleProxyProtocol` 接口（`build` / `start` / `stop` / `set_transport`），`build()` 拉取或启动容器并等待容器内 RPC 就绪，`start()` 才调用远端 `start()` RPC。
+
+### 1.4 rpyc IPC：服务端 + 客户端
+
+rpyc 是当前运行时的主 IPC。服务端 `RpycServer`（`coordination/rpyc_server.py:33`）被 `ModuleCoordinator.__init__` 以 `self._rpyc = RpycServer(self)` 持有，`start()` 方法动态 `type(..., (CoordinatorService,), {"_coordinator": self._coordinator})` 构造一个绑定具体 coordinator 的 rpyc service 类，交给 `rpyc.utils.server.ThreadedServer` 监听 `global_config.listen_host:0`（由 OS 分配空闲端口）、放入一个 daemon 线程 `coordinator-rpyc` 启动，返回实际绑定的端口号——这个端口号会写进 `RunEntry.rpyc_port`（§6.2）。
+
+`coordination/rpyc_services.py` 暴露两类服务接口：`CoordinatorService`（`:32`）提供 `exposed_list_modules` / `exposed_get_module_endpoint` / `exposed_load_blueprint_by_name` / `exposed_load_blueprint_pickled` / `exposed_restart_module_by_class_name`——即 daemon 对外的发现 + 动态加载 API；`WorkerRpycService`（`:78`）供 per-worker 惰性启动的 rpyc 端口使用，`exposed_get_module(module_id)` 直接返回 worker 进程内的 module 对象。这两种 service 都开启 `allow_all_attrs / allow_public_attrs / allow_pickle`，因此 proxy 可以做到穿透属性访问。
+
+客户端在 `dimos/core/rpc_client.py`。`ModuleProxyProtocol`（`:88`）是 host 侧句柄的统一接口（`build` / `start` / `stop` / `set_transport`），Python 轨的 `RPCClient`（`:97`）与 Docker 轨的 `DockerModuleProxy` 都实现它。`RPCClient.__getattr__` 将 Module 类声明的 rpc 方法包装为 `RpcCall` 远程调用对象，非 rpc 属性则穿透到底层 `actor_instance` 走 pipe 抓取；当拿到 `RemoteStream` 时会把 owner 改写成 parent 侧代理，保证 `owner.set_transport(...)` 在远程 stream 上仍可用。`AsyncSpecProxy`（`:166`）把同步 RPC 调用封装成 awaitable，让 Spec 里声明 `async def` 的方法从事件循环角度保持非阻塞。
+
+本地与远程走同一条 rpyc 管道，porcelain facade（后续批次会详述）就是靠 `CoordinatorService.exposed_*` + `WorkerRpycService.exposed_get_module` 把 out-of-process 客户端绑到一个运行中的 daemon。旧的 `multiprocessing.Pipe` 已经从 coordination 核心路径退回到单一 worker 的内部消息通道。
+
+`dimos/protocol/rpc/pubsubrpc.py` 仍存在（`LCMRPC` / `ShmRPC` 等类供 `protocol/rpc/test_*.py`、`protocol/rpc/redisrpc.py` 引用）但已从 coordination 路径 de-link——PR 9d7806615 删除了 RpcCall 对 LCMRPC 的直接调用；当前启动路径不再触发 pubsubrpc 栈，只作为 reference 实现留在代码树里。
+
+### 1.5 动态 blueprint 装卸
+
+`ModuleCoordinator` 在启动后仍可热装卸（PR #1744）。三个 API 位于 `coordination/module_coordinator.py`：`load_blueprint(blueprint, blueprint_args=None)`（`:279`）把一份 blueprint 装进已经 `start()` 过的 coordinator，自动按 blueprint 的 `n_workers` global-config override 递增扩容 worker 池；`load_module(module_class, blueprint_args=None)`（`:341`）是单模块便捷封装，内部调用 `load_blueprint(module_class.blueprint(...))`；`unload_module(module_class)`（`:348`）停止模块、从 coordinator 状态剔除、worker 空了即回收进程——目前只支持 `deployment == "python"`（`:364-367`），Docker 模块不在 unload 范围。`CoordinatorService.exposed_load_blueprint_*` 把这组 API 通过 rpyc 暴露给 daemon 外客户端。
+
+### 1.6 watchdog 生命周期
+
+`coordination/watchdog_main.py` 是一个 sidecar 进程：`main(argv)` 收到 `<main_pid> <run_id>` 后，阻塞在 `wait_for_pid_exit(main_pid)`，主进程一旦消失先 `time.sleep(_GRACE_PERIOD_SECONDS=0.5)` 给主进程自身的优雅关停让路，再调用 `kill_run_processes(run_id)` 扫描全系统终结所有带匹配 `DIMOS_RUN_ID` 环境变量的后代进程，解决 SIGKILL 导致 worker 孤立的问题。
+
+`coordination/process_lifecycle.py:93` 的 `spawn_watchdog(run_id, log_dir=None)` 是封装：剥掉父进程环境里的 `DIMOS_RUN_ID`、用 `subprocess.Popen(... start_new_session=True, stdin/stdout/stderr=DEVNULL)` 拉起 `python -m dimos.core.coordination.watchdog_main <pid> <run_id>`，让 sidecar 脱离父进程 session 独立运行。`core/run_registry.py` 负责跨 run 的注册，详见 §6.2。
+
+### 1.7 Native 模块（C / C++ / Rust 子进程）
+
+`core/native_module.py:129` 的 `NativeModule` 把一个本地可执行文件当作托管子进程处理：`start()` 根据 `NativeModuleConfig` 拼出 `<executable> --<port_name> <lcm_topic_string> ... <extra_args>` 命令行——In/Out 端口名作为 CLI flag、LCM topic 字符串作为值传给 native 进程，native 进程自己去 LCM pub/sub；`stop()` 发 SIGTERM。这是 Rust native modules（PR #1794）的宿主机制，DimOS 侧不需要感知语言，只负责端口契约与进程生命周期。
+
+### 1.8 Async 模块
+
+async modules（PR #1920）覆盖 5 条能力：async dispatch serialization、module handles、process observables、RPC、RPC sync-to-async。实现散在 `core/module.py` 的 dispatcher 与 `rpc_client.AsyncSpecProxy`，测试矩阵在 `core/test_async_module_*.py` 共 6 文件（`test_async_module_main.py` / `_dispatch_serialization.py` / `_handles.py` / `_process_observable.py` / `_rpc.py` / `_rpc_sync_to_async.py`）。典型用法是 patrol / navigation 类模块需要长时间调度而又不想阻塞事件循环——具体例子见后续 navigation / patrolling subsystem 章节。
+
+### 1.9 `core/` 顶层其余成员
+
+- **资源管控**：`introspection/`（blueprint + module + svg + utils 四块，内省与可视化工具）、`resource_monitor/`（`monitor.py` 的 `StatsMonitor` 按 `g.dtop` 开关启动）、`resource.py`（`Resource` 基类，`ModuleCoordinator` 继承于此）。
+- **跨进程序列化**：`o3dpickle.py` 注册 Open3D 类型的自定义 pickler，在 `ModuleCoordinator.start()` 被 `register_picklers()` 调用。
+- **库级启动副作用**：`library_config.py:25` 的 `apply_library_config()` 只做一件事——`cv2.setNumThreads(2)`，避免 OpenCV 内部线程争用；**它不是配置系统**，别与 `GlobalConfig` 混淆。
+- **运行时入口与 daemon**：`core.py` 是 blueprint 的构建入口；`daemon.py`（`106` 行）封装 Unix double-fork `daemonize()`，详见 §6.1；`log_viewer.py` 是 CLI `dimos log` 的实现，`resolve_log_path` + `follow_log` 两个核心函数，详见 §6.3。
 
 ---
 
@@ -246,10 +259,11 @@ CLI 主进程
 | `log_dir` | `str` | 日志目录绝对路径 |
 | `cli_args` | `list[str]` | 启动时传入的 CLI 参数 |
 | `config_overrides` | `dict` | Blueprint 级别的配置覆盖 |
-| `grpc_port` | `int` | gRPC 端口（默认 9877） |
+| `grpc_port` | `int` | **legacy**——默认 9877；`check_port_conflicts()` 仍用它做端口冲突检测，但已不再是运行时 IPC |
+| `rpyc_port` | `int` | **当前主 IPC 端口**，默认 `0`，daemon 启动时由 `ModuleCoordinator.start_rpyc_service()` 写入实际绑定值 |
 | `original_argv` | `list[str]` | 完整的 `sys.argv` 快照 |
 
-注册表文件保存路径遵循 XDG 规范：`~/.local/state/dimos/runs/<run-id>.json`（若设置了 `XDG_STATE_HOME` 则以它为根）。`list_runs(alive_only=True)` 遍历该目录，对每个 `.json` 文件调用 `is_pid_alive(pid)`（`os.kill(pid, 0)` 探针），自动清理僵尸记录。
+注册表文件保存路径遵循 XDG 规范：`~/.local/state/dimos/runs/<run-id>.json`（若设置了 `XDG_STATE_HOME` 则以它为根）。`list_runs(alive_only=True)` 遍历该目录，对每个 `.json` 文件调用 `is_pid_alive(pid)`（`os.kill(pid, 0)` 探针），自动清理僵尸记录。`get_most_recent_rpyc_port(run_id=None)`（`run_registry.py:194`）按 run registry 取最新存活 run 的 rpyc 端口——指定 `run_id` 则精确匹配，否则走 `get_most_recent(alive_only=True)`；若该 entry 的 `rpyc_port == 0` 会抛出 `"Was it started with an older version of dimos?"` 提示。这是 porcelain 客户端定位活动 daemon 的入口。
 
 ### 6.3 `log_viewer.py`——日志查阅
 
