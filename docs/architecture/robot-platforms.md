@@ -367,7 +367,7 @@ OpenArm 是一款开源机械臂，PR #1897 接入。双层落点：
 
 OpenArm 集成同时引入了一批跨平台机械臂基础设施，这些内容**留作 Batch G 展开**，此处只列指针：
 
-- `dimos/types/manipulation.py`（8 个操纵相关数据类型）+ `dimos/types/robot_capabilities.py`（机器人能力声明，详见 Batch G.3）
+- `dimos/types/manipulation.py`（9 个操纵相关数据类型）+ `dimos/types/robot_capabilities.py`（机器人能力声明，详见 subsystems § 12）
 - `dimos/skills/manipulation/` 6 个通用操纵 skill（详见 Batch G.4）
 - `dimos/utils/workspace.py`（314 行 URDF / workspace 几何工具）
 
