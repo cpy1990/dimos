@@ -22,7 +22,7 @@
 sequenceDiagram
   autonumber
   participant U as 用户 (CLI/MCP)
-  participant A as Agent<br/>(LangChain LLM)
+  participant A as Agent<br/>(AgentSpec 实现者)
   participant NS as NavigationSkillContainer<br/>agents/skills/navigation.py
   participant GO2 as GO2Connection<br/>robot/unitree/go2/connection.py
   participant D2D as Detection2DModule<br/>perception/detection/module2D.py
@@ -101,7 +101,7 @@ Agent 收到自然语言指令后，LLM 对可用 Skill 列表进行推理（zer
 
 | 症状 | 首先检查 | 源码位置 |
 |------|---------|---------|
-| `_latest_image` 始终为 `None` | GO2Connection 的 `video_stream()` 是否已 subscribe | `go2/connection.py` 中 `onimage` / `video_stream().subscribe(...)` |
+| `_latest_image` 始终为 `None` | GO2Connection 的 `video_stream()` 是否已 subscribe | `dimos/robot/unitree/go2/connection.py` 中 `onimage` / `video_stream().subscribe(...)` |
 | Detection2DModule 无输出 | `sharpness_barrier` 丢帧阈值 / `max_freq=10` 限速 | `perception/detection/module2D.py` `sharpness_barrier` 串联 |
 | LCM detections stream 无消息 | `detector.detections.transport` 是否已配置 | `perception/detection/module2D.py` 中 `detector.detections.transport = LCMTransport(...)` |
 | navigate_with_text 无声跌落 | SpatialMemory / ObjectTracking RPC 连接 | `agents/skills/navigation.py` `_navigate_to_object` / `_navigate_using_semantic_map` |
@@ -407,14 +407,14 @@ if x.format == ImageFormat.BGR:
 
 | 维度 | 正常模式 | --replay 模式 | 变化的代码位置 |
 |------|---------|-------------|-------------|
-| **数据来源** | WebRTC → 真实机器人 | `LegacyPickleStore` → pickle 文件 | `go2/connection.py` `make_connection()` |
-| **Connection 类** | `UnitreeWebRTCConnection` | `ReplayConnection` | `go2/connection.py` `ReplayConnection` |
+| **数据来源** | WebRTC → 真实机器人 | `LegacyPickleStore` → pickle 文件 | `dimos/robot/unitree/go2/connection.py` `make_connection()` |
+| **Connection 类** | `UnitreeWebRTCConnection` | `ReplayConnection` | `dimos/robot/unitree/go2/connection.py` `ReplayConnection` |
 | **时间戳来源** | 接收帧时 `time.time()`（当前时间） | 录制时的原始 `ts`，保留不变（历史时间） | `timeseries/base.py` |
 | **发出调度** | 实时推送（WebRTC 驱动） | `TimeoutScheduler.schedule_relative(delay)` | `timeseries/base.py` |
 | **Transport 配置** | 不变 | 不变（pSHM / LCM channel 名相同） | — |
-| **机器人控制指令** | 真实执行（`move`、`standup`…） | 静默忽略（`ReplayConnection.move()` 直接返回 `True`） | `go2/connection.py` `ReplayConnection.move` |
+| **机器人控制指令** | 真实执行（`move`、`standup`…） | 静默忽略（`ReplayConnection.move()` 直接返回 `True`） | `dimos/robot/unitree/go2/connection.py` `ReplayConnection.move` |
 | **硬件状态** | 动态（真实 IMU、编码器反馈） | 静态（仅来自 odom pickle） | — |
-| **数据循环** | 无 | `loop=True`（默认），录制结束后自动循环 | `go2/connection.py` `ReplayConnection.__init__` |
+| **数据循环** | 无 | `loop=True`（默认），录制结束后自动循环 | `dimos/robot/unitree/go2/connection.py` `ReplayConnection.__init__` |
 | **ZED 相机** | `ZEDModule` 实例 | `FakeZEDModule` 实例 | `hardware/sensors/fake_zed_module.py` |
 | **确定性** | 非确定（网络抖动、OS 调度） | 接近确定（数据固定，OS 调度仍有微小差异） | — |
 | **Agent LLM** | 不变（正常调用） | 不变（正常调用，LLM 本身不确定） | — |

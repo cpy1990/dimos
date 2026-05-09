@@ -80,7 +80,7 @@ dimos/robot/unitree/go2/
 └── go2.urdf             # URDF 模型文件（供 MuJoCo 加载）
 ```
 
-蓝图按功能深度分三层：`basic` 只做连接与遥控；`smart` 叠加感知与地图；`agentic` 进一步叠加 LLM 代理与技能调用。`unitree-go2-agentic-mcp` 是目前唯一内置 `McpServer` 的蓝图，是所有 `dimos mcp …` 命令的唯一有效目标。
+蓝图按功能深度分三层：`basic` 只做连接与遥控；`smart` 叠加感知与地图；`agentic` 进一步叠加 LLM 代理与技能调用。`unitree-go2-agentic-mcp` 是内置 `McpServer` 的 agentic 蓝图之一（同系列还有 `_huggingface` / `_ollama` / `_security` / `_temporal_memory` 变体，详见 §1.1），可作为 `dimos mcp …` 命令的目标蓝图。
 
 #### Go2 rage mode
 
@@ -633,7 +633,7 @@ dimos/simulation/unity/
 |---|---|
 | `unitree-go2-basic` | Go2 最小连接 + 键盘遥控 |
 | `unitree-go2-agentic` | Go2 + LLM 代理 + 技能调用 |
-| `unitree-go2-agentic-mcp` | Go2 + 代理 + MCP 服务器（唯一支持 `dimos mcp` 的蓝图）|
+| `unitree-go2-agentic-mcp` | Go2 + 代理 + MCP 服务器（agentic 系列之一，详见 §1.1）|
 | `unitree-go2-temporal-memory` | Go2 + 时序记忆代理 |
 | `unitree-go2-fleet` | Go2 多机群控 |
 | `unitree-go2-ros` | Go2 + ROS 2 导航 |
