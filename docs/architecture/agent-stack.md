@@ -1,6 +1,6 @@
 # 专题：Agent 栈（Agent Stack）
 
-> 与 [README § 4](README.md#-4-agent-系统) 配套深入：Agent 内部循环、@skill schema、双 skills 决策树、Spec、MCP、agent 变种。
+> 与 [README § 4](/docs/architecture/README.md#-4-agent-系统) 配套深入：Agent 内部循环、@skill schema、双 skills 决策树、Spec、MCP、agent 变种。
 > 目标读者：正在编写新 skill、集成新 LLM、或组合 MCP-enabled blueprint 的工程师。
 
 ## 目录
@@ -335,7 +335,7 @@ class GlobalCostmap(Protocol):
     global_costmap: Out[OccupancyGrid]
 ```
 
-**`dimos/spec/utils.py`**：提供 `is_spec`、`spec_structural_compliance`、`spec_annotation_compliance` 三个工具函数，被 `dimos/core/blueprints.py` 在 `autoconnect` 阶段调用。
+**`dimos/spec/utils.py`**：提供 `is_spec`、`spec_structural_compliance`、`spec_annotation_compliance` 三个工具函数，被 `dimos/core/coordination/blueprints.py` 在 `autoconnect` 阶段调用。
 
 ### 4.3 构建期验证流程
 
@@ -571,7 +571,7 @@ unitree_go2_agentic_mcp = autoconnect(
 
 ## 扩展阅读
 
-- 总览：[README](README.md)
-- 运行时模型深度：[runtime-model.md](runtime-model.md)
+- 总览：[README](/docs/architecture/README.md)
+- 运行时模型深度：[runtime-model.md](/docs/architecture/runtime-model.md)
 - 能力：[`docs/capabilities/agents/`](../capabilities/agents/)
 - `AGENTS.md`：@skill 完整规则、Spec/RPC 接线规范、系统提示词参考

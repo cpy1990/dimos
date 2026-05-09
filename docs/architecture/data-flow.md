@@ -1,6 +1,6 @@
 # 专题：端到端数据流（Data Flow）
 
-> 与 [README § 7](README.md#-7-端到端数据流) 配套深入：完整字段级 trace、--replay 模式差异、第二个 manipulation trace。
+> 与 [README § 7](/docs/architecture/README.md#-7-端到端数据流) 配套深入：完整字段级 trace、--replay 模式差异、第二个 manipulation trace。
 >
 > **目标读者**：正在调试流停滞（stream stall）、类型不匹配（type mismatch）或 replay 模式行为差异的工程师。本文提供字段级别的数据追踪，使你无需反复在源码中跳转。
 
@@ -412,8 +412,8 @@ Replay 模式**接近确定性但不完全确定**：
 
 ## 扩展阅读
 
-- 总览：[README](README.md) § 7
-- Stream/Transport 原理：[runtime-model](runtime-model.md)
-- Agent 系统与 Skill 注册：[agent-stack](agent-stack.md)
-- 平台层（GO2/G1/MuJoCo）：[robot-platforms](robot-platforms.md)
-- 能力子系统（感知/导航/建图）：[subsystems](subsystems.md)
+- 总览：[README](/docs/architecture/README.md) § 7
+- Stream/Transport 原理：[runtime-model](/docs/architecture/runtime-model.md)
+- Agent 系统与 Skill 注册：[agent-stack](/docs/architecture/agent-stack.md)
+- 平台层（GO2/G1/MuJoCo）：[robot-platforms](/docs/architecture/robot-platforms.md)
+- 能力子系统（感知/导航/建图）：[subsystems](/docs/architecture/subsystems.md)
