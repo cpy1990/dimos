@@ -81,9 +81,9 @@ git status
 # DimOS 系统架构（System Architecture）
 
 > 给新工程师的全景文档：通读后无需跳转即可建立完整心智模型（约 1.5 小时）。
-> 想深入某个细节再翻同目录 5 份专题：[runtime-model](runtime-model.md) /
-> [agent-stack](agent-stack.md) / [robot-platforms](robot-platforms.md) /
-> [subsystems](subsystems.md) / [data-flow](data-flow.md)。
+> 想深入某个细节再翻同目录 5 份专题：[runtime-model](/docs/architecture/runtime-model.md) /
+> [agent-stack](/docs/architecture/agent-stack.md) / [robot-platforms](/docs/architecture/robot-platforms.md) /
+> [subsystems](/docs/architecture/subsystems.md) / [data-flow](/docs/architecture/data-flow.md)。
 
 ## 目录
 
@@ -144,7 +144,7 @@ git status
 
 ## 扩展阅读
 
-- 仓库速查与必踩坑：[`AGENTS.md`](../../AGENTS.md)
+- 仓库速查与必踩坑：[`AGENTS.md`](/AGENTS.md)
 - 使用教程：[`docs/usage/`](../usage/)
 - 能力深度文档：[`docs/capabilities/`](../capabilities/)
 - 平台配置：[`docs/platforms/`](../platforms/)
@@ -177,8 +177,8 @@ git status
 ## 扩展阅读
 
 - 总览：[README](README.md)
-- CLI：[`docs/usage/cli.md`](../usage/cli.md)
-- 配置：[`docs/usage/configuration.md`](../usage/configuration.md)
+- CLI：[`docs/usage/cli.md`](/docs/usage/cli.md)
+- 配置：[`docs/usage/configuration.md`](/docs/usage/configuration.md)
 ```
 
 类似为 `agent-stack.md` / `robot-platforms.md` / `subsystems.md` / `data-flow.md` 写入"标题 + 目录占位 + 扩展阅读"骨架。每份目录条目：
@@ -697,7 +697,7 @@ CLI --foo bar 标志（最高优先级）
 | `dimos top` | 类 top 监控 |
 | `dimos rerun-bridge` | Rerun 可视化桥 |
 
-详细参考：[`AGENTS.md`](../../AGENTS.md) 的 CLI Reference 段。
+详细参考：[`AGENTS.md`](/AGENTS.md) 的 CLI Reference 段。
 
 #### 关键避坑（命名重叠 2）：agent-send vs agent_send
 
@@ -845,7 +845,7 @@ classDiagram
 | `dimos/agents/skills/` | person_follow、gps_nav_skill、navigation、speak_skill、google_maps_skill_container、osm | 历史 / 第三方集成 / 通用都有 |
 
 **诚实结论**：两处分布是历史演进结果，不存在干净的"通用 vs 特化"对仗。
-加新 skill 时贴近其依赖位置即可；详细判断决策树留给 [agent-stack.md](agent-stack.md)。
+加新 skill 时贴近其依赖位置即可；详细判断决策树留给 [agent-stack.md](/docs/architecture/agent-stack.md)。
 
 #### 关键避坑（命名重叠 5）：dimos/skills/manipulation/ ≠ dimos/manipulation/
 
@@ -863,7 +863,7 @@ classDiagram
 4. **不与 `@rpc` 叠加**：两者目的不同，叠加会导致 schema 二次生成出错
 
 破坏任一规则的失败模式：启动时 schema 生成失败、Module 注册失败、或更隐
-蔽地 silent skip。详见 [`AGENTS.md`](../../AGENTS.md) "Schema generation
+蔽地 silent skip。详见 [`AGENTS.md`](/AGENTS.md) "Schema generation
 rules"。
 
 #### RPC Wiring：Spec Protocol（推荐）vs rpc_calls list（legacy）
@@ -1491,7 +1491,7 @@ git commit -m "docs(architecture): README §6 — visualization/teleop/msgs/type
 2. 简化时序：摄像头 → Perception（物体检测） → Memory（短时记忆） → Agent（LLM 决策） → Skill（导航） → Robot 控制 → 反馈 → TTS
 3. Mermaid `sequenceDiagram` 时序图
 4. 涉及的关键 stream 名 / 类型 / transport（**只列锚点**）：详细字段、Replay 模式差异、第二个 manipulation trace 全部留给 `data-flow.md`
-5. § 7 末尾明示："详细字段级 trace、`--replay` 模式差异、manipulation trace 见 [`data-flow.md`](data-flow.md)"
+5. § 7 末尾明示："详细字段级 trace、`--replay` 模式差异、manipulation trace 见 [`data-flow.md`](/docs/architecture/data-flow.md#L3)"
 
 - [ ] **Step 2: 列 § 8 必含事实**
 
@@ -1555,7 +1555,7 @@ sequenceDiagram
 | TTS | `skills.speak` | RPC | LCM |
 
 > **更深入**：详细字段级 trace、`--replay` 模式差异、manipulation 路径
-> 见 [`data-flow.md`](data-flow.md)。
+> 见 [`data-flow.md`](/docs/architecture/data-flow.md)。
 ```
 
 字数目标：§ 7 800-1000 字（不含图表）。
@@ -1571,17 +1571,17 @@ sequenceDiagram
 
 | 文档 | 适用场景 |
 |---|---|
-| [`runtime-model.md`](runtime-model.md) | 调试进程/transport/日志 |
-| [`agent-stack.md`](agent-stack.md) | 写新 skill / 集成 LLM |
-| [`robot-platforms.md`](robot-platforms.md) | 上新机器人/末端 |
-| [`subsystems.md`](subsystems.md) | 进入某个子系统改代码 |
-| [`data-flow.md`](data-flow.md) | 跟 stream 卡顿/类型不匹配 |
+| [`runtime-model.md`](/docs/architecture/runtime-model.md) | 调试进程/transport/日志 |
+| [`agent-stack.md`](/docs/architecture/agent-stack.md) | 写新 skill / 集成 LLM |
+| [`robot-platforms.md`](/docs/architecture/robot-platforms.md) | 上新机器人/末端 |
+| [`subsystems.md`](/docs/architecture/subsystems.md) | 进入某个子系统改代码 |
+| [`data-flow.md`](/docs/architecture/data-flow.md) | 跟 stream 卡顿/类型不匹配 |
 
 #### 仓库其他文档
 
 | 文档 | 用途 |
 |---|---|
-| [`AGENTS.md`](../../AGENTS.md) | quick-start cheat sheet 与"必踩的坑"（不在本文档重复） |
+| [`AGENTS.md`](/AGENTS.md) | quick-start cheat sheet 与"必踩的坑"（不在本文档重复） |
 | [`docs/usage/`](../usage/) | 使用教程 |
 | [`docs/capabilities/`](../capabilities/) | 能力深度文档 |
 | [`docs/platforms/`](../platforms/) | 具体硬件平台 |
