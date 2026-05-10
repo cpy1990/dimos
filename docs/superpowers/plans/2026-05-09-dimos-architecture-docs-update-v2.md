@@ -1320,4 +1320,3 @@ Expected: 推成功。CI 启动约 1h。
 3. **行号漂移**：60+ commits 后 `docs/architecture/` 自身行号也漂了；每批开工前重 `grep -n` 定位，**不要**引用本 plan 的"line ≈ 301-310"字面作 Edit 锚点。
 4. **路径前缀规则**：所有 `unitree/go2/*` 路径必须带 `dimos/robot/` 前缀（同理 `unitree/g1/*`）；批 F 开工前读 spec §0.6.A 表再动笔。
 5. **双写隐患**：`whole_body/` 只在 robot-platforms.md §5.5 写；`unity/` 只在 §6.6；不要在 subsystems.md 重写（spec §0.5 明示的位置锁定）。
-

@@ -721,13 +721,3 @@ CLI entrypoint `dimos.robot.cli.dimos:main` 暴露：
 - 2026-05-09 v1 spec：第二轮 draft，已撤销（4 类系统性缺陷见 §0）
 - 本 v2：第二轮最终版，方法论从"基于 audit + reviewer 反驳"改为"基于 main-side inventory"
 
-
-
-
-
-
-
-
-
-
-
